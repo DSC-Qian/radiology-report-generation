@@ -172,3 +172,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Image files
+*.jpg
+*.jpeg
+*.dcm
+/images/
+
+# Report files
+/reports/
