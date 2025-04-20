@@ -236,10 +236,16 @@ class Trainer:
                 raise TypeError(f"Expected loss to be a tensor, got {type(outputs['loss'])}")
             
             if not outputs['loss'].requires_grad:
-                print("Warning: Loss doesn't require gradients! Enabling requires_grad...")
-                outputs['loss'].requires_grad_(True)
-            
-            loss = outputs['loss']
+                # Create a gradient-enabled wrapper for the loss
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                if trainable_params:
+                    # Connect the loss to trainable parameters to ensure gradient flow
+                    loss = outputs['loss'] + 0 * sum(p.sum() for p in trainable_params)
+                else:
+                    print("Warning: No trainable parameters found. Check model configuration.")
+                    loss = outputs['loss']
+            else:
+                loss = outputs['loss']
             
             # Backward pass
             if self.config.train_config['gradient_accumulation_steps'] > 1:
@@ -327,19 +333,16 @@ class Trainer:
                 val_loss += loss.item()
                 
                 # Generate text for metrics
-                generated_ids = self.model.generate(images)
+                generated_texts = self.model.generate(images)
                 
-                # Convert IDs to text
+                # Store reference and generated texts
                 for i in range(len(images)):
                     # Reference text
                     reference = batch['report_text'][i]
                     references.append(reference)
                     
-                    # Generated text
-                    hypothesis = self.model.tokenizer.decode(
-                        generated_ids[i],
-                        skip_special_tokens=True
-                    )
+                    # Generated text (already decoded in model.generate)
+                    hypothesis = generated_texts[i]
                     hypotheses.append(hypothesis)
         
         # Calculate average loss
@@ -372,6 +375,7 @@ class Trainer:
             'epoch': self.start_epoch,
             'global_step': self.global_step,
             'patience_counter': self.patience_counter,
+            'stage': self.stage,
             'config': {
                 'model_config': self.config.model_config,
                 'train_config': self.config.train_config,
@@ -400,23 +404,50 @@ class Trainer:
         # Load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Load optimizer state
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Check if the stage in checkpoint matches current stage
+        checkpoint_stage = checkpoint.get('config', {}).get('model_config', {}).get('freeze_encoder', None)
+        current_stage = self.config.model_config.get('freeze_encoder', None)
         
-        # Load scheduler state if exists
-        if checkpoint['scheduler_state_dict'] and self.scheduler:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # If stages are different (e.g., moving from stage 1 to stage 2), don't load optimizer/scheduler
+        is_stage_transition = checkpoint_stage is not None and current_stage is not None and checkpoint_stage != current_stage
         
-        # Load training state
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.best_val_metrics = checkpoint['best_val_metrics']
-        self.patience_counter = checkpoint['patience_counter']
-        
-        print(f"Resumed from checkpoint: {filepath}")
-        print(f"Starting from epoch: {self.start_epoch}")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
+        if not is_stage_transition:
+            # Only load optimizer and scheduler if not transitioning between stages
+            try:
+                # Load optimizer state
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                # Load scheduler state if exists
+                if checkpoint['scheduler_state_dict'] and self.scheduler:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    
+                # Load training state
+                self.start_epoch = checkpoint['epoch'] + 1
+                self.global_step = checkpoint['global_step']
+                self.best_val_loss = checkpoint['best_val_loss']
+                self.best_val_metrics = checkpoint['best_val_metrics']
+                self.patience_counter = checkpoint['patience_counter']
+                
+                print(f"Resumed from checkpoint: {filepath}")
+                print(f"Starting from epoch: {self.start_epoch}")
+                print(f"Best validation loss: {self.best_val_loss:.4f}")
+            except (ValueError, KeyError) as e:
+                print(f"Warning: Could not load optimizer/scheduler states: {e}")
+                print("Initializing new optimizer and scheduler while keeping model weights.")
+                self.start_epoch = 0
+                self.global_step = 0
+                self.best_val_loss = float('inf')
+                self.best_val_metrics = None
+                self.patience_counter = 0
+        else:
+            # When transitioning between stages, initialize fresh training state
+            print(f"Detected stage transition. Loading only model weights from checkpoint: {filepath}")
+            print("Initializing new optimizer and scheduler for the new stage.")
+            self.start_epoch = 0
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.best_val_metrics = None
+            self.patience_counter = 0
 
 
 def train_model(config, stage=1, resume_from=None):

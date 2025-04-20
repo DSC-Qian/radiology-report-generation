@@ -170,6 +170,10 @@ class Config:
         
         if args.config_file is not None:
             self.load(args.config_file)
+        
+        # Update CSV file if provided
+        if hasattr(args, 'csv_file') and args.csv_file is not None:
+            self.csv_file = args.csv_file
 
 
 def get_parser():

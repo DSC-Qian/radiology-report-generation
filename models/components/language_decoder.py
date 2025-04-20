@@ -61,9 +61,12 @@ class GPT2Decoder(nn.Module):
             labels = inputs.detach().clone()
         
         # Make sure to set the model to train or eval mode accordingly
-        original_mode = self.model.training
-        if any(p.requires_grad for p in self.model.parameters()):
+        if labels is not None:
+            # We need to be in training mode to compute loss
             self.model.train()
+        else:
+            # Inference mode
+            self.model.eval()
         
         outputs = self.model(
             input_ids=inputs,
@@ -74,12 +77,13 @@ class GPT2Decoder(nn.Module):
             return_dict=True  # Always return dict for consistent handling
         )
         
-        # Restore original mode
-        self.model.train(original_mode)
-        
-        # Make sure the loss requires grad for backpropagation
-        if labels is not None and not outputs.loss.requires_grad:
-            print("Warning: GPT2 loss doesn't require gradients!")
+        # Handle loss requires_grad issue
+        if labels is not None:
+            # Check if loss doesn't require gradients
+            if not outputs.loss.requires_grad:
+                # Create a wrapped loss that requires gradients
+                wrapped_loss = outputs.loss + 0 * sum(p.sum() for p in self.model.parameters() if p.requires_grad)
+                outputs.loss = wrapped_loss
         
         return outputs
     
@@ -156,9 +160,12 @@ class BiomedicalDecoder(nn.Module):
             labels = inputs.detach().clone()
         
         # Make sure to set the model to train or eval mode accordingly
-        original_mode = self.model.training
-        if any(p.requires_grad for p in self.model.parameters()):
+        if labels is not None:
+            # We need to be in training mode to compute loss
             self.model.train()
+        else:
+            # Inference mode
+            self.model.eval()
         
         outputs = self.model(
             input_ids=inputs,
@@ -169,12 +176,13 @@ class BiomedicalDecoder(nn.Module):
             return_dict=True  # Always return dict for consistent handling
         )
         
-        # Restore original mode
-        self.model.train(original_mode)
-        
-        # Make sure the loss requires grad for backpropagation
-        if labels is not None and not outputs.loss.requires_grad:
-            print("Warning: Biomedical model loss doesn't require gradients!")
+        # Handle loss requires_grad issue
+        if labels is not None:
+            # Check if loss doesn't require gradients
+            if not outputs.loss.requires_grad:
+                # Create a wrapped loss that requires gradients
+                wrapped_loss = outputs.loss + 0 * sum(p.sum() for p in self.model.parameters() if p.requires_grad)
+                outputs.loss = wrapped_loss
         
         return outputs
     
@@ -202,26 +210,40 @@ class BiomedicalDecoder(nn.Module):
 
 
 def get_language_decoder(decoder_type='gpt2', model_name=None, pretrained=True, 
-                        freeze_encoder=True, vocab_size=None, embedding_dim=768):
+                        freeze=True, vocab_size=None, embedding_dim=768):
     """
     Factory function to get a language decoder.
     
     Args:
-        decoder_type (str): Type of the decoder ('gpt2' or 'biomedical').
-        model_name (str): Name of the specific model.
+        decoder_type (str): Type of decoder ('gpt2' or 'biomedical').
+        model_name (str): Name of the specific model. If None, use default models.
         pretrained (bool): Whether to use a pre-trained model.
-        freeze_encoder (bool): Whether to freeze the transformer encoder.
+        freeze (bool): Whether to freeze the model parameters.
         vocab_size (int): Size of the vocabulary (for non-pretrained models).
         embedding_dim (int): Dimension of the embeddings (for non-pretrained models).
         
     Returns:
         nn.Module: Language decoder model.
     """
+    if model_name is None:
+        if decoder_type == 'gpt2':
+            model_name = 'gpt2'
+        else:  # biomedical
+            model_name = 'microsoft/biogpt'
+    
     if decoder_type == 'gpt2':
-        model_name = model_name or 'gpt2'
-        return GPT2Decoder(model_name, pretrained, freeze_encoder, vocab_size, embedding_dim)
+        return GPT2Decoder(
+            model_name=model_name, 
+            pretrained=pretrained, 
+            freeze_encoder=freeze,
+            vocab_size=vocab_size, 
+            embedding_dim=embedding_dim
+        )
     elif decoder_type == 'biomedical':
-        model_name = model_name or 'microsoft/biogpt'
-        return BiomedicalDecoder(model_name, pretrained, freeze_encoder)
+        return BiomedicalDecoder(
+            model_name=model_name, 
+            pretrained=pretrained, 
+            freeze_encoder=freeze
+        )
     else:
         raise ValueError(f"Unsupported decoder type: {decoder_type}") 

@@ -1,0 +1,52 @@
+{
+    "model_config": {
+        "encoder_type": "resnet",
+        "encoder_model": "resnet18",
+        "pretrained_encoder": true,
+        "freeze_encoder": true,
+        "mapper_type": "transformer",
+        "mapper_hidden_dim": 512,
+        "mapper_num_layers": 1,
+        "mapper_num_heads": 4,
+        "mapper_seq_len": 8,
+        "mapper_dropout": 0.1,
+        "decoder_type": "gpt2",
+        "decoder_model": "gpt2",
+        "pretrained_decoder": true,
+        "freeze_decoder": true,
+        "tokenizer_name": "gpt2",
+        "max_length": 256
+    },
+    "train_config": {
+        "train_batch_size": 2,
+        "val_batch_size": 2,
+        "test_batch_size": 2,
+        "num_workers": 2,
+        "test_size": 0.1,
+        "val_size": 0.1,
+        "seed": 42,
+        "optimizer": "adam",
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-5,
+        "adam_epsilon": 1e-8,
+        "num_epochs": 5,
+        "warmup_steps": 50,
+        "gradient_accumulation_steps": 4,
+        "max_grad_norm": 1.0,
+        "early_stopping_patience": 2,
+        "scheduler": "linear_warmup",
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 1,
+        "log_interval": 10,
+        "eval_interval": 1,
+        "save_interval": 1
+    },
+    "eval_config": {
+        "metrics": ["bleu", "rouge"],
+        "beam_size": 2,
+        "max_length": 256,
+        "min_length": 10,
+        "no_repeat_ngram_size": 3,
+        "early_stopping": true
+    }
+} 

@@ -34,61 +34,96 @@ class RadiologyReportGenerator(nn.Module):
                  decoder_type='gpt2', decoder_model='gpt2', freeze_encoder=True,
                  freeze_decoder=True, pretrained_encoder=True, pretrained_decoder=True,
                  tokenizer_name='gpt2', max_length=512):
-        super(RadiologyReportGenerator, self).__init__()
+        super().__init__()
         
-        # Save configuration
+        # Save parameters
         self.encoder_type = encoder_type
+        self.encoder_model = encoder_model
         self.mapper_type = mapper_type
         self.decoder_type = decoder_type
+        self.decoder_model = decoder_model
         self.max_length = max_length
         
-        # Initialize tokenizer
+        # Save freeze parameters
+        self.freeze_encoder = freeze_encoder
+        self.freeze_decoder = freeze_decoder
+        
+        # Init tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        
+        # Configure tokenizer properly for GPT2 and other models
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Update the tokenizer's vocabulary with the pad token
+            self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
         
-        # Initialize vision encoder
+        # Set padding side to left for autoregressive models like GPT2
+        self.tokenizer.padding_side = 'left'
+        
+        # Define encoder
         self.vision_encoder = get_vision_encoder(
-            encoder_type=encoder_type,
-            model_name=encoder_model,
+            encoder_type,
+            encoder_model,
             pretrained=pretrained_encoder,
             freeze=freeze_encoder
         )
         
-        # Initialize language decoder
-        self.language_decoder = get_language_decoder(
-            decoder_type=decoder_type,
-            model_name=decoder_model,
-            pretrained=pretrained_decoder,
-            freeze_encoder=freeze_decoder
-        )
+        # Define encoder output dimension
+        if encoder_type == 'resnet':
+            if encoder_model == 'resnet18' or encoder_model == 'resnet34':
+                encoder_dim = 512
+            else:  # resnet50, resnet101, resnet152
+                encoder_dim = 2048
+        else:  # ViT
+            encoder_dim = 768  # For base ViT models
         
-        # Initialize mapping network
-        encoder_output_dim = self.vision_encoder.output_dim
-        decoder_embedding_dim = self.language_decoder.embedding_dim
-        
+        # Define mapping network
         self.mapping_network = get_mapping_network(
-            mapper_type=mapper_type,
-            input_dim=encoder_output_dim,
+            mapper_type,
+            input_dim=encoder_dim,
             hidden_dim=mapper_hidden_dim,
-            output_dim=decoder_embedding_dim,
+            output_dim=mapper_hidden_dim,
             num_layers=mapper_num_layers,
             num_heads=mapper_num_heads,
             seq_len=mapper_seq_len,
             dropout=mapper_dropout
         )
         
-        # If using transformer mapper, need embedding adapter
+        # Define embedding adapter
         if mapper_type == 'transformer':
-            # Create embeddings adapter to convert mapped features to decoder inputs
-            self.embedding_adapter = nn.Linear(
-                mapper_seq_len * decoder_embedding_dim,
-                decoder_embedding_dim
-            )
+            # For transformer mapper, adapt the flattened output to decoder embedding dim
+            mapper_output_dim = mapper_hidden_dim * mapper_seq_len
+            self.embedding_adapter = nn.Linear(mapper_output_dim, mapper_hidden_dim)
         
-        # Store training configuration
-        self.freeze_encoder = freeze_encoder
-        self.freeze_decoder = freeze_decoder
+        # Define language decoder
+        self.language_decoder = get_language_decoder(
+            decoder_type,
+            decoder_model,
+            pretrained=pretrained_decoder,
+            freeze=freeze_decoder
+        )
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """
+        Initialize weights for the model.
+        """
+        # Initialize weights for mapping network
+        if hasattr(self.mapping_network, 'apply'):
+            def init_weights(m):
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            
+            self.mapping_network.apply(init_weights)
+        
+        # Initialize weights for embedding adapter if exists
+        if hasattr(self, 'embedding_adapter'):
+            nn.init.xavier_uniform_(self.embedding_adapter.weight)
+            nn.init.zeros_(self.embedding_adapter.bias)
     
     def forward(self, images, input_ids=None, attention_mask=None, labels=None):
         """
@@ -158,7 +193,9 @@ class RadiologyReportGenerator(nn.Module):
                     input_ids=prompt_ids,
                     max_length=self.max_length,
                     num_beams=4,
-                    early_stopping=True
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    min_length=10
                 )
                 
                 return {"generated_ids": outputs}
@@ -206,7 +243,9 @@ class RadiologyReportGenerator(nn.Module):
                     input_ids=prompt_ids,
                     max_length=self.max_length,
                     num_beams=4,
-                    early_stopping=True
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    min_length=10
                 )
                 
                 return {"generated_ids": outputs}
@@ -219,21 +258,88 @@ class RadiologyReportGenerator(nn.Module):
             images (torch.Tensor): Input images of shape (batch_size, channels, height, width).
             
         Returns:
-            list: Generated report texts.
+            list: List of generated report texts.
         """
         # Set model to evaluation mode
         self.eval()
         
+        # Extract image features
         with torch.no_grad():
-            # Forward pass to get generated IDs
-            outputs = self.forward(images)
-            generated_ids = outputs["generated_ids"]
+            image_features = self.vision_encoder(images)
+        
+        # Map image features to decoder-compatible embeddings
+        if self.mapper_type == 'mlp':
+            mapped_features = self.mapping_network(image_features)
             
-            # Convert IDs to text
-            generated_texts = []
-            for ids in generated_ids:
-                text = self.tokenizer.decode(ids, skip_special_tokens=True)
-                generated_texts.append(text)
+            # Add batch dimension if needed
+            if len(mapped_features.shape) == 1:
+                mapped_features = mapped_features.unsqueeze(0)
+                
+            # Create a prompt with BOS token
+            prompt_ids = torch.full(
+                (image_features.size(0), 1),
+                self.tokenizer.bos_token_id,
+                dtype=torch.long,
+                device=image_features.device
+            )
+            
+            # Create attention mask - all 1s for the prompt
+            attention_mask = torch.ones_like(prompt_ids)
+            
+            # Generate text
+            with torch.no_grad():
+                outputs = self.language_decoder.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    max_length=self.max_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    num_beams=4,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    min_length=10
+                )
+        else:  # transformer mapper
+            # Transformer mapper outputs a sequence of embeddings
+            mapped_features = self.mapping_network(image_features)
+            
+            # Flatten the sequence for the embedding adapter
+            batch_size = mapped_features.size(0)
+            flat_features = mapped_features.view(batch_size, -1)
+            
+            # Adapt to decoder embeddings
+            adapted_features = self.embedding_adapter(flat_features)
+            
+            # Create a prompt with BOS token
+            prompt_ids = torch.full(
+                (image_features.size(0), 1),
+                self.tokenizer.bos_token_id,
+                dtype=torch.long,
+                device=image_features.device
+            )
+            
+            # Create attention mask - all 1s for the prompt
+            attention_mask = torch.ones_like(prompt_ids)
+            
+            # Generate text
+            with torch.no_grad():
+                outputs = self.language_decoder.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    max_length=self.max_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    num_beams=4,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    min_length=10
+                )
+        
+        # Decode generated tokens to text
+        generated_texts = []
+        for ids in outputs:
+            text = self.tokenizer.decode(ids, skip_special_tokens=True)
+            generated_texts.append(text.strip())
         
         return generated_texts
 

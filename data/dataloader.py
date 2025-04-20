@@ -31,8 +31,17 @@ class MIMICCXRDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.max_length = max_length
+        
+        # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Update the tokenizer's vocabulary with the pad token
+            self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
+        
+        # Set padding side to left for GPT-2 (decoder-only) models
+        if 'gpt2' in tokenizer_name.lower():
+            self.tokenizer.padding_side = 'left'
         
         # Filter the dataframe to include only existing files
         print("Filtering dataset to include only existing files...")

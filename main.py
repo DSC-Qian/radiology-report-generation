@@ -97,10 +97,17 @@ def main():
     """
     # Parse command-line arguments
     parser = get_parser()
+    parser.add_argument('--csv_file', type=str, default=None,
+                       help='Path to the CSV file with image-report pairs. Overrides the default path.')
     args = parser.parse_args()
     
     # Create configuration
     config = Config(args)
+    
+    # Override CSV file path if provided
+    if args.csv_file is not None:
+        config.csv_file = args.csv_file
+        print(f"Using custom CSV file: {config.csv_file}")
     
     # Create output directories
     create_output_dirs(config)
