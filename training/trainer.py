@@ -7,7 +7,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, AdamW
-from torch.cuda.amp import autocast, GradScaler
 
 from data.dataloader import get_dataloader
 from models.report_generator import get_report_generator
@@ -28,16 +27,6 @@ class Trainer:
         self.stage = stage
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Default GPU memory optimization settings if not in config
-        self.config.train_config.setdefault('use_mixed_precision', True)  # Enable mixed precision by default
-        self.config.train_config.setdefault('train_batch_size', 4)  # Reduce default batch size
-        self.config.train_config.setdefault('val_batch_size', 4)  # Reduce default batch size
-        self.config.train_config.setdefault('gradient_accumulation_steps', 4)  # Increase gradient accumulation
-        self.config.train_config.setdefault('max_length', 128)  # Ensure sequence length is limited
-        
-        # Set up mixed precision training
-        self.scaler = GradScaler(enabled=self.config.train_config['use_mixed_precision'])
-        
         # Update model config based on training stage
         if stage == 1:
             # Stage 1: Freeze encoder, train mapper and decoder
@@ -52,24 +41,11 @@ class Trainer:
         self.model = get_report_generator(self.config.model_config)
         self.model.to(self.device)
         
-        # Print GPU memory information
-        if torch.cuda.is_available():
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
-            print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-            print(f"Mixed precision training: {'Enabled' if self.config.train_config['use_mixed_precision'] else 'Disabled'}")
-        
         # Print model's trainable parameters
         print("Trainable parameters:")
-        total_params = 0
-        trainable_params = 0
         for name, param in self.model.named_parameters():
-            num_params = param.numel()
-            total_params += num_params
             if param.requires_grad:
-                trainable_params += num_params
                 print(f"  {name}")
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
         
         # Create data loaders
         self.train_loader = get_dataloader(
@@ -166,7 +142,6 @@ class Trainer:
         """
         print(f"Starting training (Stage {self.stage})...")
         print(f"Using device: {self.device}")
-        print(f"Batch size: {self.config.train_config['train_batch_size']} (effective: {self.config.train_config['train_batch_size'] * self.config.train_config['gradient_accumulation_steps']})")
         print(f"Number of training samples: {len(self.train_loader.dataset)}")
         print(f"Number of validation samples: {len(self.val_loader.dataset)}")
         
@@ -214,12 +189,6 @@ class Trainer:
                 self.save_checkpoint(
                     os.path.join(self.config.checkpoint_dir, f"checkpoint_stage{self.stage}_epoch{epoch+1}.pt")
                 )
-            
-            # Log GPU memory usage after each epoch if available
-            if torch.cuda.is_available():
-                max_memory = torch.cuda.max_memory_allocated() / 1e9
-                print(f"Max GPU memory used: {max_memory:.2f} GB")
-                torch.cuda.reset_peak_memory_stats()
         
         # Close tensorboard writer
         self.writer.close()
@@ -254,40 +223,40 @@ class Trainer:
             # The model handles masking internally
             labels = input_ids.clone()
             
-            # Forward pass with mixed precision
-            with autocast(enabled=self.config.train_config['use_mixed_precision']):
-                outputs = self.model(
-                    images=images,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-                # Check if loss is a tensor and requires grad
-                if not isinstance(outputs['loss'], torch.Tensor):
-                    raise TypeError(f"Expected loss to be a tensor, got {type(outputs['loss'])}")
-                
-                loss = outputs['loss']
-                
-                # Scale loss for gradient accumulation
-                if self.config.train_config['gradient_accumulation_steps'] > 1:
-                    loss = loss / self.config.train_config['gradient_accumulation_steps']
+            # Forward pass
+            outputs = self.model(
+                images=images,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
             
-            # Backward pass with mixed precision
-            self.scaler.scale(loss).backward()
+            # Check if loss is a tensor and requires grad
+            if not isinstance(outputs['loss'], torch.Tensor):
+                raise TypeError(f"Expected loss to be a tensor, got {type(outputs['loss'])}")
+            
+            if not outputs['loss'].requires_grad:
+                print("Warning: Loss doesn't require gradients! Enabling requires_grad...")
+                outputs['loss'].requires_grad_(True)
+            
+            loss = outputs['loss']
+            
+            # Backward pass
+            if self.config.train_config['gradient_accumulation_steps'] > 1:
+                loss = loss / self.config.train_config['gradient_accumulation_steps']
+            
+            loss.backward()
             
             # Update weights if gradient accumulation steps are reached
             if (batch_idx + 1) % self.config.train_config['gradient_accumulation_steps'] == 0:
-                # Clip gradients with mixed precision
-                self.scaler.unscale_(self.optimizer)
+                # Clip gradients
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.model.parameters() if p.requires_grad],
                     self.config.train_config['max_grad_norm']
                 )
                 
-                # Update weights with mixed precision
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # Update weights
+                self.optimizer.step()
                 
                 # Update scheduler if using linear warmup
                 if self.config.train_config['scheduler'] == 'linear_warmup':
@@ -312,10 +281,6 @@ class Trainer:
                     loss.item() * self.config.train_config['gradient_accumulation_steps'],
                     self.global_step
                 )
-                
-            # Clear GPU cache periodically if memory is tight
-            if (batch_idx + 1) % 50 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
         
         # Calculate average loss
         epoch_loss /= len(self.train_loader)
@@ -331,7 +296,7 @@ class Trainer:
         Evaluate the model on the validation set.
         
         Returns:
-            tuple: Validation loss and metrics.
+            tuple: Validation loss and metrics dictionary.
         """
         self.model.eval()
         val_loss = 0.0
@@ -350,44 +315,32 @@ class Trainer:
                 # Set labels for autoregressive training (shift input_ids right)
                 labels = input_ids.clone()
                 
-                # Forward pass with mixed precision
-                with autocast(enabled=self.config.train_config['use_mixed_precision']):
-                    outputs = self.model(
-                        images=images,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
-                    
-                    loss = outputs['loss']
+                # Forward pass
+                outputs = self.model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
                 
+                loss = outputs['loss']
                 val_loss += loss.item()
                 
-                # Generate text for metrics - use smaller batch size if needed
-                max_gen_batch_size = max(1, self.config.train_config['val_batch_size'] // 2)
-                for i in range(0, len(images), max_gen_batch_size):
-                    batch_images = images[i:i+max_gen_batch_size]
-                    with autocast(enabled=self.config.train_config['use_mixed_precision']):
-                        batch_generated_ids = self.model.generate(batch_images)
-                    
-                    # Add generated texts to the list
-                    for j in range(len(batch_images)):
-                        idx = i + j
-                        if idx < len(images):  # Safety check
-                            # Reference text
-                            reference = batch['report_text'][idx]
-                            references.append(reference)
-                            
-                            # Generated text
-                            hypothesis = self.model.tokenizer.decode(
-                                batch_generated_ids[j],
-                                skip_special_tokens=True
-                            )
-                            hypotheses.append(hypothesis)
+                # Generate text for metrics
+                generated_ids = self.model.generate(images)
                 
-                # Clear GPU cache after each batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Convert IDs to text
+                for i in range(len(images)):
+                    # Reference text
+                    reference = batch['report_text'][i]
+                    references.append(reference)
+                    
+                    # Generated text
+                    hypothesis = self.model.tokenizer.decode(
+                        generated_ids[i],
+                        skip_special_tokens=True
+                    )
+                    hypotheses.append(hypothesis)
         
         # Calculate average loss
         val_loss /= len(self.val_loader)
@@ -414,7 +367,6 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler_state_dict': self.scaler.state_dict(),  # Save mixed precision scaler state
             'best_val_loss': self.best_val_loss,
             'best_val_metrics': self.best_val_metrics,
             'epoch': self.start_epoch,
@@ -455,10 +407,6 @@ class Trainer:
         if checkpoint['scheduler_state_dict'] and self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Load mixed precision scaler state if exists
-        if 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
         # Load training state
         self.start_epoch = checkpoint['epoch'] + 1
         self.global_step = checkpoint['global_step']
@@ -483,8 +431,5 @@ def train_model(config, stage=1, resume_from=None):
     Returns:
         tuple: Best validation loss and metrics.
     """
-    # Set environment variables for better GPU memory management
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-    
     trainer = Trainer(config, stage, resume_from)
     return trainer.train() 
