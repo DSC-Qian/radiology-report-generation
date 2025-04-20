@@ -7,6 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, AdamW
+from torch.cuda.amp import autocast, GradScaler
 
 from data.dataloader import get_dataloader
 from models.report_generator import get_report_generator
@@ -27,12 +28,15 @@ class Trainer:
         self.stage = stage
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Log device information
-        if torch.cuda.is_available():
-            print(f"Using GPU: {torch.cuda.get_device_name()}")
-            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        else:
-            print("Using CPU")
+        # Default GPU memory optimization settings if not in config
+        self.config.train_config.setdefault('use_mixed_precision', True)  # Enable mixed precision by default
+        self.config.train_config.setdefault('train_batch_size', 4)  # Reduce default batch size
+        self.config.train_config.setdefault('val_batch_size', 4)  # Reduce default batch size
+        self.config.train_config.setdefault('gradient_accumulation_steps', 4)  # Increase gradient accumulation
+        self.config.train_config.setdefault('max_length', 128)  # Ensure sequence length is limited
+        
+        # Set up mixed precision training
+        self.scaler = GradScaler(enabled=self.config.train_config['use_mixed_precision'])
         
         # Update model config based on training stage
         if stage == 1:
@@ -48,25 +52,26 @@ class Trainer:
         self.model = get_report_generator(self.config.model_config)
         self.model.to(self.device)
         
+        # Print GPU memory information
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            print(f"Mixed precision training: {'Enabled' if self.config.train_config['use_mixed_precision'] else 'Disabled'}")
+        
         # Print model's trainable parameters
         print("Trainable parameters:")
+        total_params = 0
         trainable_params = 0
-        all_params = 0
         for name, param in self.model.named_parameters():
-            all_params += param.numel()
+            num_params = param.numel()
+            total_params += num_params
             if param.requires_grad:
-                trainable_params += param.numel()
+                trainable_params += num_params
                 print(f"  {name}")
-        print(f"Trainable parameters: {trainable_params:,} / {all_params:,} ({trainable_params/all_params:.2%})")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
         
         # Create data loaders
-        print(f"Creating data loaders with data path: {self.config.data_path}")
-        print(f"CSV file: {self.config.csv_file}")
-        
-        # Ensure the CSV file exists
-        if not os.path.exists(self.config.csv_file):
-            raise FileNotFoundError(f"CSV file not found: {self.config.csv_file}")
-        
         self.train_loader = get_dataloader(
             csv_file=self.config.csv_file,
             root_dir=self.config.data_path,
@@ -93,13 +98,8 @@ class Trainer:
             seed=self.config.train_config['seed']
         )
         
-        # Ensure output directories exist
-        os.makedirs(self.config.log_dir, exist_ok=True)
-        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-        
         # Setup tensorboard
-        log_dir = os.path.join(self.config.log_dir, f"stage{stage}_{time.strftime('%Y%m%d-%H%M%S')}")
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = SummaryWriter(log_dir=os.path.join(self.config.log_dir, f"stage{stage}"))
         
         # Create optimizer
         # Get parameters that require gradients
@@ -166,6 +166,7 @@ class Trainer:
         """
         print(f"Starting training (Stage {self.stage})...")
         print(f"Using device: {self.device}")
+        print(f"Batch size: {self.config.train_config['train_batch_size']} (effective: {self.config.train_config['train_batch_size'] * self.config.train_config['gradient_accumulation_steps']})")
         print(f"Number of training samples: {len(self.train_loader.dataset)}")
         print(f"Number of validation samples: {len(self.val_loader.dataset)}")
         
@@ -210,11 +211,15 @@ class Trainer:
             
             # Save checkpoint periodically
             if (epoch + 1) % self.config.train_config['save_interval'] == 0:
-                checkpoint_path = os.path.join(
-                    self.config.checkpoint_dir, 
-                    f"checkpoint_stage{self.stage}_epoch{epoch+1}.pt"
+                self.save_checkpoint(
+                    os.path.join(self.config.checkpoint_dir, f"checkpoint_stage{self.stage}_epoch{epoch+1}.pt")
                 )
-                self.save_checkpoint(checkpoint_path)
+            
+            # Log GPU memory usage after each epoch if available
+            if torch.cuda.is_available():
+                max_memory = torch.cuda.max_memory_allocated() / 1e9
+                print(f"Max GPU memory used: {max_memory:.2f} GB")
+                torch.cuda.reset_peak_memory_stats()
         
         # Close tensorboard writer
         self.writer.close()
@@ -239,18 +244,18 @@ class Trainer:
         progress_bar = tqdm(self.train_loader, desc="Training")
         
         for batch_idx, batch in enumerate(progress_bar):
-            try:
-                # Move batch to device
-                images = batch['image'].to(self.device)
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                
-                # Set labels for autoregressive training (shift input_ids right)
-                # For GPT models, typically labels are the same as input_ids
-                # The model handles masking internally
-                labels = input_ids.clone()
-                
-                # Forward pass
+            # Move batch to device
+            images = batch['image'].to(self.device)
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            
+            # Set labels for autoregressive training (shift input_ids right)
+            # For GPT models, typically labels are the same as input_ids
+            # The model handles masking internally
+            labels = input_ids.clone()
+            
+            # Forward pass with mixed precision
+            with autocast(enabled=self.config.train_config['use_mixed_precision']):
                 outputs = self.model(
                     images=images,
                     input_ids=input_ids,
@@ -262,74 +267,55 @@ class Trainer:
                 if not isinstance(outputs['loss'], torch.Tensor):
                     raise TypeError(f"Expected loss to be a tensor, got {type(outputs['loss'])}")
                 
-                if not outputs['loss'].requires_grad:
-                    print("Warning: Loss doesn't require gradients! Enabling requires_grad...")
-                    outputs['loss'].requires_grad_(True)
-                
                 loss = outputs['loss']
                 
-                # Backward pass
+                # Scale loss for gradient accumulation
                 if self.config.train_config['gradient_accumulation_steps'] > 1:
                     loss = loss / self.config.train_config['gradient_accumulation_steps']
-                
-                loss.backward()
-                
-                # Update weights if gradient accumulation steps are reached
-                if (batch_idx + 1) % self.config.train_config['gradient_accumulation_steps'] == 0:
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.parameters() if p.requires_grad],
-                        self.config.train_config['max_grad_norm']
-                    )
-                    
-                    # Update weights
-                    self.optimizer.step()
-                    
-                    # Update scheduler if using linear warmup
-                    if self.config.train_config['scheduler'] == 'linear_warmup':
-                        self.scheduler.step()
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-                    
-                    # Update global step
-                    self.global_step += 1
-                
-                # Update progress bar
-                epoch_loss += loss.item() * self.config.train_config['gradient_accumulation_steps']
-                progress_bar.set_postfix({
-                    'loss': epoch_loss / (batch_idx + 1)
-                })
-                
-                # Log to tensorboard
-                if (self.global_step + 1) % self.config.train_config['log_interval'] == 0:
-                    self.writer.add_scalar(
-                        'Loss/train',
-                        loss.item() * self.config.train_config['gradient_accumulation_steps'],
-                        self.global_step
-                    )
-                    
-                    # Log learning rate
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    self.writer.add_scalar('learning_rate', current_lr, self.global_step)
-                    
-                    # Log GPU memory usage if available
-                    if torch.cuda.is_available():
-                        self.writer.add_scalar(
-                            'gpu/memory_allocated',
-                            torch.cuda.memory_allocated() / 1e9,  # Convert to GB
-                            self.global_step
-                        )
-                        self.writer.add_scalar(
-                            'gpu/memory_reserved',
-                            torch.cuda.memory_reserved() / 1e9,  # Convert to GB
-                            self.global_step
-                        )
             
-            except Exception as e:
-                print(f"Error processing batch {batch_idx}: {e}")
-                # Skip this batch and continue with the next one
-                continue
+            # Backward pass with mixed precision
+            self.scaler.scale(loss).backward()
+            
+            # Update weights if gradient accumulation steps are reached
+            if (batch_idx + 1) % self.config.train_config['gradient_accumulation_steps'] == 0:
+                # Clip gradients with mixed precision
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.config.train_config['max_grad_norm']
+                )
+                
+                # Update weights with mixed precision
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Update scheduler if using linear warmup
+                if self.config.train_config['scheduler'] == 'linear_warmup':
+                    self.scheduler.step()
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Update global step
+                self.global_step += 1
+            
+            # Update progress bar
+            epoch_loss += loss.item() * self.config.train_config['gradient_accumulation_steps']
+            progress_bar.set_postfix({
+                'loss': epoch_loss / (batch_idx + 1)
+            })
+            
+            # Log to tensorboard
+            if (self.global_step + 1) % self.config.train_config['log_interval'] == 0:
+                self.writer.add_scalar(
+                    'Loss/train',
+                    loss.item() * self.config.train_config['gradient_accumulation_steps'],
+                    self.global_step
+                )
+                
+            # Clear GPU cache periodically if memory is tight
+            if (batch_idx + 1) % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Calculate average loss
         epoch_loss /= len(self.train_loader)
@@ -345,7 +331,7 @@ class Trainer:
         Evaluate the model on the validation set.
         
         Returns:
-            tuple: Validation loss and metrics dictionary.
+            tuple: Validation loss and metrics.
         """
         self.model.eval()
         val_loss = 0.0
@@ -356,16 +342,16 @@ class Trainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation"):
-                try:
-                    # Move batch to device
-                    images = batch['image'].to(self.device)
-                    input_ids = batch['input_ids'].to(self.device)
-                    attention_mask = batch['attention_mask'].to(self.device)
-                    
-                    # Set labels for autoregressive training (shift input_ids right)
-                    labels = input_ids.clone()
-                    
-                    # Forward pass
+                # Move batch to device
+                images = batch['image'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                
+                # Set labels for autoregressive training (shift input_ids right)
+                labels = input_ids.clone()
+                
+                # Forward pass with mixed precision
+                with autocast(enabled=self.config.train_config['use_mixed_precision']):
                     outputs = self.model(
                         images=images,
                         input_ids=input_ids,
@@ -374,28 +360,34 @@ class Trainer:
                     )
                     
                     loss = outputs['loss']
-                    val_loss += loss.item()
-                    
-                    # Generate text for metrics
-                    generated_ids = self.model.generate(images)
-                    
-                    # Convert IDs to text
-                    for i in range(len(images)):
-                        # Reference text
-                        reference = batch['report_text'][i]
-                        references.append(reference)
-                        
-                        # Generated text
-                        hypothesis = self.model.tokenizer.decode(
-                            generated_ids[i],
-                            skip_special_tokens=True
-                        )
-                        hypotheses.append(hypothesis)
                 
-                except Exception as e:
-                    print(f"Error during validation: {e}")
-                    # Skip this batch and continue with the next one
-                    continue
+                val_loss += loss.item()
+                
+                # Generate text for metrics - use smaller batch size if needed
+                max_gen_batch_size = max(1, self.config.train_config['val_batch_size'] // 2)
+                for i in range(0, len(images), max_gen_batch_size):
+                    batch_images = images[i:i+max_gen_batch_size]
+                    with autocast(enabled=self.config.train_config['use_mixed_precision']):
+                        batch_generated_ids = self.model.generate(batch_images)
+                    
+                    # Add generated texts to the list
+                    for j in range(len(batch_images)):
+                        idx = i + j
+                        if idx < len(images):  # Safety check
+                            # Reference text
+                            reference = batch['report_text'][idx]
+                            references.append(reference)
+                            
+                            # Generated text
+                            hypothesis = self.model.tokenizer.decode(
+                                batch_generated_ids[j],
+                                skip_special_tokens=True
+                            )
+                            hypotheses.append(hypothesis)
+                
+                # Clear GPU cache after each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Calculate average loss
         val_loss /= len(self.val_loader)
@@ -408,13 +400,6 @@ class Trainer:
         for metric_name, metric_value in metrics.items():
             print(f"{metric_name}: {metric_value:.4f}")
         
-        # Log some examples
-        num_examples = min(3, len(hypotheses))
-        for i in range(num_examples):
-            print(f"\nExample {i+1}:")
-            print(f"Reference: {references[i][:200]}...")
-            print(f"Generated: {hypotheses[i][:200]}...")
-        
         return val_loss, metrics
     
     def save_checkpoint(self, filepath, is_best=False):
@@ -425,13 +410,11 @@ class Trainer:
             filepath (str): Path to save the checkpoint.
             is_best (bool): Whether this is the best model so far.
         """
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict(),  # Save mixed precision scaler state
             'best_val_loss': self.best_val_loss,
             'best_val_metrics': self.best_val_metrics,
             'epoch': self.start_epoch,
@@ -444,14 +427,10 @@ class Trainer:
             }
         }
         
-        try:
-            torch.save(checkpoint, filepath)
-            print(f"Checkpoint saved to {filepath}")
-            
-            if is_best:
-                print(f"This is the best model so far with validation loss: {self.best_val_loss:.4f}")
-        except Exception as e:
-            print(f"Error saving checkpoint to {filepath}: {e}")
+        torch.save(checkpoint, filepath)
+        
+        if is_best:
+            print(f"Saving best model with validation loss: {self.best_val_loss:.4f}")
     
     def load_checkpoint(self, filepath):
         """
@@ -464,33 +443,32 @@ class Trainer:
             print(f"Checkpoint not found: {filepath}")
             return
         
-        try:
-            print(f"Loading checkpoint from {filepath}")
-            checkpoint = torch.load(filepath, map_location=self.device)
-            
-            # Load model weights
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            
-            # Load optimizer state
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # Load scheduler state if exists
-            if checkpoint['scheduler_state_dict'] and self.scheduler:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            
-            # Load training state
-            self.start_epoch = checkpoint['epoch'] + 1
-            self.global_step = checkpoint['global_step']
-            self.best_val_loss = checkpoint['best_val_loss']
-            self.best_val_metrics = checkpoint['best_val_metrics']
-            self.patience_counter = checkpoint['patience_counter']
-            
-            print(f"Resumed from checkpoint: {filepath}")
-            print(f"Starting from epoch: {self.start_epoch}")
-            print(f"Best validation loss: {self.best_val_loss:.4f}")
-        except Exception as e:
-            print(f"Error loading checkpoint from {filepath}: {e}")
-            print("Training will start from scratch.")
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # Load model weights
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load optimizer state
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load scheduler state if exists
+        if checkpoint['scheduler_state_dict'] and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Load mixed precision scaler state if exists
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        # Load training state
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.global_step = checkpoint['global_step']
+        self.best_val_loss = checkpoint['best_val_loss']
+        self.best_val_metrics = checkpoint['best_val_metrics']
+        self.patience_counter = checkpoint['patience_counter']
+        
+        print(f"Resumed from checkpoint: {filepath}")
+        print(f"Starting from epoch: {self.start_epoch}")
+        print(f"Best validation loss: {self.best_val_loss:.4f}")
 
 
 def train_model(config, stage=1, resume_from=None):
@@ -505,5 +483,8 @@ def train_model(config, stage=1, resume_from=None):
     Returns:
         tuple: Best validation loss and metrics.
     """
+    # Set environment variables for better GPU memory management
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    
     trainer = Trainer(config, stage, resume_from)
     return trainer.train() 
