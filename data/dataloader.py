@@ -166,8 +166,8 @@ def get_transforms(phase):
         ])
 
 
-def get_dataloader(csv_file, root_dir='.', batch_size=32, num_workers=4, max_length=512,
-                  split='train', tokenizer_name='gpt2', test_size=0.1, val_size=0.1, seed=42):
+def get_dataloader(csv_file, root_dir='../data/mimic-cxr-jpg/', batch_size=32, num_workers=4, max_length=512,
+                  split='train', tokenizer_name='gpt2', test_size=0.1, val_size=0.1, seed=42, max_samples=None):
     """
     Create data loaders for training, validation and testing.
     

@@ -16,7 +16,7 @@ class Config:
         """
         # Project paths
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.data_path = os.path.join(self.project_root, '.')
+        self.data_path = os.path.join(self.project_root, '../data/mimic-cxr-jpg/')
         self.csv_file = os.path.join(self.data_path, 'mimic-cxr-list-filtered.csv')
         
         # Create output directories if they don't exist
@@ -60,36 +60,36 @@ class Config:
         # Training configuration
         self.train_config = {
             # Data settings
-            'train_batch_size': 16,
-            'val_batch_size': 16,
-            'test_batch_size': 16,
-            'num_workers': 4,
-            'test_size': 0.1,
-            'val_size': 0.1,
+            'train_batch_size': 64,
+            'val_batch_size': 32,
+            'test_batch_size': 32,
+            'num_workers': 16,
+            'pin_memory': True,
+            'persistent_workers': True,
             'seed': 42,
-            
+            'max_samples': 1000,           
+
             # Optimizer settings
-            'optimizer': 'adam',  # 'adam' or 'adamw'
-            'learning_rate': 1e-4,
+            'optimizer': 'adamw',
+            'learning_rate': 4e-4,
             'weight_decay': 1e-5,
             'adam_epsilon': 1e-8,
-            
+
             # Training settings
             'num_epochs': 50,
-            'warmup_steps': 500,
+            'warmup_steps': 1000,
             'gradient_accumulation_steps': 1,
             'max_grad_norm': 1.0,
-            'early_stopping_patience': 5,
-            
+
             # Scheduler settings
-            'scheduler': 'linear_warmup',  # 'linear_warmup' or 'reduce_on_plateau'
+            'scheduler': 'linear_warmup',
             'scheduler_factor': 0.5,
             'scheduler_patience': 2,
-            
-            # Logging settings
+
+            # Logging & checkpointing
             'log_interval': 100,
-            'eval_interval': 1,  # Evaluate every n epochs
-            'save_interval': 1,  # Save checkpoint every n epochs
+            'eval_interval': 1,
+            'save_interval': 1
         }
         
         # Evaluation configuration

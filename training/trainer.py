@@ -6,7 +6,8 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
-from transformers import get_linear_schedule_with_warmup, AdamW
+from transformers import get_linear_schedule_with_warmup
+from torch.optim   import AdamW 
 
 from data.dataloader import get_dataloader
 from models.report_generator import get_report_generator
@@ -58,7 +59,8 @@ class Trainer:
             tokenizer_name=self.config.model_config['tokenizer_name'],
             test_size=self.config.train_config['test_size'],
             val_size=self.config.train_config['val_size'],
-            seed=self.config.train_config['seed']
+            seed=self.config.train_config['seed'],
+            max_samples=self.config.train_config['max_samples']
         )
         
         self.val_loader = get_dataloader(
@@ -71,7 +73,8 @@ class Trainer:
             tokenizer_name=self.config.model_config['tokenizer_name'],
             test_size=self.config.train_config['test_size'],
             val_size=self.config.train_config['val_size'],
-            seed=self.config.train_config['seed']
+            seed=self.config.train_config['seed'],
+            max_samples=self.config.train_config['max_samples']
         )
         
         # Setup tensorboard
