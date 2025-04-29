@@ -9,6 +9,8 @@ from transformers import AutoTokenizer
 import random
 from tqdm import tqdm
 
+# Set the global default for AutoTokenizer to use left padding for all future from_pretrained calls, to ensure left padding is used even in DataLoader workers.
+AutoTokenizer.padding_side = 'left'
 
 class MIMICCXRDataset(Dataset):
     """
@@ -33,15 +35,14 @@ class MIMICCXRDataset(Dataset):
         self.max_length = max_length
         
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, padding_side='left')
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             # Update the tokenizer's vocabulary with the pad token
             self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
         
-        # Set padding side to left for GPT-2 (decoder-only) models
-        if 'gpt2' in tokenizer_name.lower():
-            self.tokenizer.padding_side = 'left'
+        # Ensure padding side is left for decoder-only architectures
+        self.tokenizer.padding_side = 'left'
         
         # Filter the dataframe to include only existing files
         print("Filtering dataset to include only existing files...")
@@ -111,6 +112,8 @@ class MIMICCXRDataset(Dataset):
         with open(report_path, 'r', encoding='utf-8') as f:
             report = f.read().strip()
         
+        # Ensure left padding before tokenization (robust to multiprocessing)
+        self.tokenizer.padding_side = 'left'
         # Tokenize report
         tokenized_report = self.tokenizer(
             report,
@@ -167,7 +170,7 @@ def get_transforms(phase):
 
 
 def get_dataloader(csv_file, root_dir='../data/mimic-cxr-jpg/', batch_size=32, num_workers=4, max_length=512,
-                  split='train', tokenizer_name='gpt2', test_size=0.1, val_size=0.1, seed=42, max_samples=None):
+                  split='train', tokenizer_name='gpt2', test_size=0.1, val_size=0.1, seed=42, max_samples=10000):
     """
     Create data loaders for training, validation and testing.
     
@@ -199,6 +202,12 @@ def get_dataloader(csv_file, root_dir='../data/mimic-cxr-jpg/', batch_size=32, n
         val_size=val_size,
         seed=seed
     )
+
+    # If max_samples is set, only take that many examples (fast prototyping)
+    if max_samples is not None:
+        from torch.utils.data import Subset
+        max_samples = min(max_samples, len(dataset))
+        dataset = Subset(dataset, list(range(max_samples)))
     
     shuffle = (split == 'train')
     
@@ -207,7 +216,8 @@ def get_dataloader(csv_file, root_dir='../data/mimic-cxr-jpg/', batch_size=32, n
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     return dataloader 

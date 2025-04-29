@@ -1,14 +1,16 @@
 import os
 import modal
+from transformers import AutoTokenizer
 
 # 1. Instantiate the App with default image and volumes
 image = (
     modal.Image.debian_slim()
     .pip_install([
         "torch", "torchvision",
-        "transformers", "huggingface-hub", "tensorboard",
-        "evaluate", "bert-score", "rouge-score", "nltk",
-        "pandas", "numpy", "tqdm", "Pillow"
+        "transformers", "huggingface-hub", "hf_xet", "tensorboard",
+        "evaluate", "nltk==3.8.1", "rouge-score", "bert-score",
+        "pandas", "numpy", "tqdm", "Pillow",
+        "scikit-learn", "torchxrayvision"
     ])
     .add_local_python_source("data")
     .add_local_python_source("utils")
@@ -34,6 +36,8 @@ torch.backends.cudnn.allow_tf32    = True
 # Enable cuDNN autotuner
 torch.backends.cudnn.benchmark   = True
 
+AutoTokenizer.padding_side = 'left'
+
 def set_seed(seed: int):
     import random, numpy as np, torch
     random.seed(seed)
@@ -51,7 +55,7 @@ def create_output_dirs(config):
     os.makedirs(config.result_dir, exist_ok=True)
 
 @app.function(
-    gpu="A10G",
+    gpu="L40S",
     timeout=4 * 60 * 60,
     volumes={"/data": data_volume,        # Mount data volume at /data
              "/model": model_volume}
@@ -59,6 +63,9 @@ def create_output_dirs(config):
 def train_remote(stage: int = 1, checkpoint: str = None, csv_file: str = None):
     from utils.config import Config
     from training.trainer import train_model
+    import nltk
+
+    nltk.download('punkt', quiet=True)
 
     # Override paths for Modal environment
     config = Config()
@@ -96,12 +103,16 @@ def train_remote(stage: int = 1, checkpoint: str = None, csv_file: str = None):
 def evaluate_remote(stage: int = 1, checkpoint: str = None, csv_file: str = None):
     from utils.config import Config
     from evaluation.evaluate import evaluate_model
+    import nltk
+
+    # Download NLTK data for tokenization in metrics
+    nltk.download('punkt', quiet=True)
 
     config = Config()
     if csv_file:
         config.csv_file = csv_file
-    config.data_path = "/data"
-    config.output_dir = "/model"
+    config.data_path = "../data/mimic-cxr-jpg"
+    config.output_dir = "../model"
     config.checkpoint_dir = os.path.join(config.output_dir, "checkpoints")
     config.log_dir = os.path.join(config.output_dir, "logs")
     config.result_dir = os.path.join(config.output_dir, "results")
@@ -118,8 +129,15 @@ def evaluate_remote(stage: int = 1, checkpoint: str = None, csv_file: str = None
     print(f"=== Evaluating Stage {stage} with {checkpoint} ===")
     metrics = evaluate_model(config, checkpoint)
     print("=== Metrics ===")
-    for k, v in metrics.items():
-        print(f"{k}: {v:.4f}")
+    if metrics:
+        for k, v in metrics.items():
+            # Check if the value is numeric before formatting
+            if isinstance(v, (int, float)):
+                print(f"{k}: {v:.4f}")
+            else:
+                print(f"{k}: {v}") # Print non-numeric values (like error messages) directly
+    else:
+        print("Evaluation did not return any metrics.")
 
 @app.local_entrypoint()
 def main(
@@ -138,4 +156,4 @@ def main(
     elif mode == "eval":
         evaluate_remote.remote(stage, checkpoint, csv_file)
     else:
-        raise ValueError("mode must be 'train' or 'eval'")  # :contentReference[oaicite:5]{index=5}
+        raise ValueError("mode must be 'train' or 'eval'")

@@ -1,134 +1,43 @@
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2Config, AutoConfig, AutoModelForCausalLM
+from transformers import GPT2LMHeadModel, GPT2Config
+from typing import Optional, Dict, Any, Union, Tuple
 
 
 class GPT2Decoder(nn.Module):
     """
     GPT-2 based decoder for generating radiology reports.
+    Uses cross-attention to attend to vision features from the encoder.
     
     Args:
         model_name (str): Name of the pre-trained GPT-2 model.
         pretrained (bool): Whether to use a pre-trained model.
         freeze_encoder (bool): Whether to freeze the transformer encoder.
-        vocab_size (int): Size of the vocabulary.
-        embedding_dim (int): Dimension of the embeddings.
+        vocab_size (int): Size of the vocabulary (for non-pretrained models).
+        embedding_dim (int): Dimension of the embeddings (for non-pretrained models).
     """
-    def __init__(self, model_name='gpt2', pretrained=True, freeze_encoder=True, 
-                 vocab_size=None, embedding_dim=768):
+    def __init__(
+        self, 
+        model_name: str = 'gpt2', 
+        pretrained: bool = True, 
+        freeze_encoder: bool = True, 
+        vocab_size: Optional[int] = None, 
+        embedding_dim: int = 768
+    ):
         super(GPT2Decoder, self).__init__()
         
-        # Load pre-trained GPT-2 model
+        # Load pre-trained GPT-2 model with cross-attention enabled
+        # Always load the base config, enable cross-attention, then load or init the model
+        config = GPT2Config.from_pretrained(model_name)
+        config.add_cross_attention = True  # This is crucial for attending to vision features
+        config.return_dict = True
+        
         if pretrained:
-            self.model = GPT2LMHeadModel.from_pretrained(model_name)
+            self.model = GPT2LMHeadModel.from_pretrained(model_name, config=config)
         else:
-            config = GPT2Config.from_pretrained(model_name)
             if vocab_size is not None:
                 config.vocab_size = vocab_size
             self.model = GPT2LMHeadModel(config)
-        
-        self.embedding_dim = self.model.config.hidden_size
-        
-        # Freeze the transformer encoder if required
-        if freeze_encoder:
-            for param in self.model.transformer.parameters():
-                param.requires_grad = False
-            
-            # Make sure lm_head is trainable even if transformer is frozen
-            for param in self.model.lm_head.parameters():
-                param.requires_grad = True
-    
-    def forward(self, inputs, attention_mask=None, labels=None, past_key_values=None,
-               use_cache=None, return_dict=None):
-        """
-        Forward pass through the model.
-        
-        Args:
-            inputs (torch.Tensor): Input IDs or embeddings, depending on input_type.
-            attention_mask (torch.Tensor): Attention mask.
-            labels (torch.Tensor): Labels for language modeling.
-            past_key_values: Past key values used for faster decoding.
-            use_cache (bool): Whether to use past key values.
-            return_dict (bool): Whether to return a dictionary or a tuple.
-            
-        Returns:
-            tuple or transformers.modeling_outputs.CausalLMOutputWithCrossAttentions:
-                Output of the GPT-2 model.
-        """
-        # Ensure labels are detached from the input_ids graph if they are the same tensor
-        # This prevents issues with double backpropagation
-        if labels is not None and torch.all(inputs == labels):
-            labels = inputs.detach().clone()
-        
-        # Make sure to set the model to train or eval mode accordingly
-        if labels is not None:
-            # We need to be in training mode to compute loss
-            self.model.train()
-        else:
-            # Inference mode
-            self.model.eval()
-        
-        outputs = self.model(
-            input_ids=inputs,
-            attention_mask=attention_mask,
-            labels=labels,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            return_dict=True  # Always return dict for consistent handling
-        )
-        
-        # Handle loss requires_grad issue
-        if labels is not None:
-            # Check if loss doesn't require gradients
-            if not outputs.loss.requires_grad:
-                # Create a wrapped loss that requires gradients
-                wrapped_loss = outputs.loss + 0 * sum(p.sum() for p in self.model.parameters() if p.requires_grad)
-                outputs.loss = wrapped_loss
-        
-        return outputs
-    
-    def generate(self, input_ids, attention_mask=None, max_length=512, **kwargs):
-        """
-        Generate text using the model.
-        
-        Args:
-            input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len).
-            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
-            max_length (int): Maximum length of the generated sequence.
-            
-        Returns:
-            torch.Tensor: Generated tokens.
-        """
-        # Set to eval mode for generation
-        self.model.eval()
-        
-        return self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_length=max_length,
-            **kwargs
-        )
-
-
-class BiomedicalDecoder(nn.Module):
-    """
-    Biomedical language model decoder for generating radiology reports.
-    Uses models like BioGPT or Clinical models.
-    
-    Args:
-        model_name (str): Name of the pre-trained biomedical language model.
-        pretrained (bool): Whether to use a pre-trained model.
-        freeze_encoder (bool): Whether to freeze the transformer encoder.
-    """
-    def __init__(self, model_name='microsoft/biogpt', pretrained=True, freeze_encoder=True):
-        super(BiomedicalDecoder, self).__init__()
-        
-        # Load pre-trained biomedical language model
-        if pretrained:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        else:
-            config = AutoConfig.from_pretrained(model_name)
-            self.model = AutoModelForCausalLM.from_config(config)
         
         self.embedding_dim = self.model.config.hidden_size
         
@@ -138,34 +47,39 @@ class BiomedicalDecoder(nn.Module):
                 if 'lm_head' not in name:  # Only allow lm_head to be trained
                     param.requires_grad = False
     
-    def forward(self, inputs, attention_mask=None, labels=None, past_key_values=None,
-               use_cache=None, return_dict=None):
+    def forward(self, 
+               inputs: torch.Tensor, 
+               attention_mask: Optional[torch.Tensor] = None, 
+               labels: Optional[torch.Tensor] = None, 
+               past_key_values: Optional[Tuple[torch.Tensor]] = None,
+               use_cache: Optional[bool] = None, 
+               return_dict: Optional[bool] = None, 
+               encoder_hidden_states: Optional[torch.Tensor] = None,
+               encoder_attention_mask: Optional[torch.Tensor] = None,
+               **kwargs) -> Dict[str, Any]:
         """
         Forward pass through the model.
         
         Args:
-            inputs (torch.Tensor): Input IDs.
+            inputs (torch.Tensor): Input IDs for the decoder.
             attention_mask (torch.Tensor): Attention mask.
             labels (torch.Tensor): Labels for language modeling.
             past_key_values: Past key values used for faster decoding.
             use_cache (bool): Whether to use past key values.
             return_dict (bool): Whether to return a dictionary or a tuple.
+            encoder_hidden_states (torch.Tensor): Hidden states from the vision encoder.
+            encoder_attention_mask (torch.Tensor): Attention mask for the encoder.
             
         Returns:
-            tuple or transformers.modeling_outputs.CausalLMOutputWithCrossAttentions:
-                Output of the model.
+            Dict: Output of the GPT-2 model.
         """
         # Ensure labels are detached from the input_ids graph if they are the same tensor
         if labels is not None and torch.all(inputs == labels):
             labels = inputs.detach().clone()
         
         # Make sure to set the model to train or eval mode accordingly
-        if labels is not None:
-            # We need to be in training mode to compute loss
-            self.model.train()
-        else:
-            # Inference mode
-            self.model.eval()
+        training_mode = labels is not None
+        self.model.train(training_mode)
         
         outputs = self.model(
             input_ids=inputs,
@@ -173,27 +87,36 @@ class BiomedicalDecoder(nn.Module):
             labels=labels,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            return_dict=True  # Always return dict for consistent handling
+            return_dict=True,  # Always return dict for consistent handling
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            **kwargs
         )
         
         # Handle loss requires_grad issue
-        if labels is not None:
-            # Check if loss doesn't require gradients
-            if not outputs.loss.requires_grad:
-                # Create a wrapped loss that requires gradients
-                wrapped_loss = outputs.loss + 0 * sum(p.sum() for p in self.model.parameters() if p.requires_grad)
-                outputs.loss = wrapped_loss
+        if training_mode and not outputs.loss.requires_grad:
+            # Create a wrapped loss that requires gradients
+            wrapped_loss = outputs.loss + 0 * sum(p.sum() for p in self.model.parameters() if p.requires_grad)
+            outputs.loss = wrapped_loss
         
         return outputs
     
-    def generate(self, input_ids, attention_mask=None, max_length=512, **kwargs):
+    def generate(self, 
+                input_ids: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None, 
+                max_length: int = 512, 
+                encoder_hidden_states: Optional[torch.Tensor] = None,
+                encoder_attention_mask: Optional[torch.Tensor] = None,
+                **kwargs) -> torch.Tensor:
         """
-        Generate text using the model.
+        Generate text using the model with cross-attention to vision features.
         
         Args:
             input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len).
             attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
             max_length (int): Maximum length of the generated sequence.
+            encoder_hidden_states (torch.Tensor): Hidden states from the vision encoder.
+            encoder_attention_mask (torch.Tensor): Attention mask for the encoder.
             
         Returns:
             torch.Tensor: Generated tokens.
@@ -201,49 +124,46 @@ class BiomedicalDecoder(nn.Module):
         # Set to eval mode for generation
         self.model.eval()
         
+        # Prepare encoder inputs for generation if provided
+        generation_kwargs = {}
+        if encoder_hidden_states is not None:
+            generation_kwargs["encoder_hidden_states"] = encoder_hidden_states
+            
+            if encoder_attention_mask is not None:
+                generation_kwargs["encoder_attention_mask"] = encoder_attention_mask
+        
         return self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=max_length,
-            **kwargs
+            **{**generation_kwargs, **kwargs}
         )
 
 
-def get_language_decoder(decoder_type='gpt2', model_name=None, pretrained=True, 
-                        freeze=True, vocab_size=None, embedding_dim=768):
+def get_language_decoder(
+    model_name: str = 'gpt2', 
+    pretrained: bool = True, 
+    freeze: bool = True, 
+    vocab_size: Optional[int] = None, 
+    embedding_dim: int = 768
+) -> nn.Module:
     """
-    Factory function to get a language decoder.
+    Factory function to get a GPT-2 language decoder with cross-attention capabilities.
     
     Args:
-        decoder_type (str): Type of decoder ('gpt2' or 'biomedical').
-        model_name (str): Name of the specific model. If None, use default models.
+        model_name (str): Name of the GPT-2 variant to use.
         pretrained (bool): Whether to use a pre-trained model.
         freeze (bool): Whether to freeze the model parameters.
         vocab_size (int): Size of the vocabulary (for non-pretrained models).
         embedding_dim (int): Dimension of the embeddings (for non-pretrained models).
         
     Returns:
-        nn.Module: Language decoder model.
+        nn.Module: GPT-2 language decoder model.
     """
-    if model_name is None:
-        if decoder_type == 'gpt2':
-            model_name = 'gpt2'
-        else:  # biomedical
-            model_name = 'microsoft/biogpt'
-    
-    if decoder_type == 'gpt2':
-        return GPT2Decoder(
-            model_name=model_name, 
-            pretrained=pretrained, 
-            freeze_encoder=freeze,
-            vocab_size=vocab_size, 
-            embedding_dim=embedding_dim
-        )
-    elif decoder_type == 'biomedical':
-        return BiomedicalDecoder(
-            model_name=model_name, 
-            pretrained=pretrained, 
-            freeze_encoder=freeze
-        )
-    else:
-        raise ValueError(f"Unsupported decoder type: {decoder_type}") 
+    return GPT2Decoder(
+        model_name=model_name, 
+        pretrained=pretrained, 
+        freeze_encoder=freeze,
+        vocab_size=vocab_size, 
+        embedding_dim=embedding_dim
+    ) 

@@ -1,57 +1,66 @@
 import torch
 import torch.nn as nn
 from models.components.vision_encoder import get_vision_encoder
-from models.components.mapping_network import get_mapping_network
 from models.components.language_decoder import get_language_decoder
 from transformers import AutoTokenizer
+from typing import Dict, List, Union, Optional, Tuple
 
 
 class RadiologyReportGenerator(nn.Module):
     """
     End-to-end model for generating radiology reports from chest X-ray images.
-    
+    Uses Vision Transformer features with cross-attention in the GPT-2 decoder.
+
     Args:
-        encoder_type (str): Type of vision encoder ('resnet' or 'vit').
-        encoder_model (str): Specific encoder model name.
-        mapper_type (str): Type of mapping network ('mlp' or 'transformer').
-        decoder_type (str): Type of language decoder ('gpt2' or 'biomedical').
-        decoder_model (str): Specific decoder model name.
-        freeze_encoder (bool): Whether to freeze the vision encoder.
+        vision_model_name (str): Name of the ViT model from Hugging Face.
+        gpt2_model_name (str): Specific GPT-2 model variant to use.
+        freeze_vision (bool): Whether to freeze the vision encoder.
         freeze_decoder (bool): Whether to freeze the language decoder.
-        pretrained_encoder (bool): Whether to use a pre-trained encoder.
+        pretrained_vision (bool): Whether to use a pre-trained vision encoder.
         pretrained_decoder (bool): Whether to use a pre-trained decoder.
-        mapper_hidden_dim (int): Hidden dimension of the mapping network.
-        mapper_num_layers (int): Number of layers in the mapping network.
-        mapper_num_heads (int): Number of attention heads in the transformer mapper.
-        mapper_seq_len (int): Length of the sequence in the transformer mapper.
-        mapper_dropout (float): Dropout probability in the mapping network.
+        decoder_hidden_dim (int): Hidden dimension required by the decoder.
         tokenizer_name (str): Name of the tokenizer to use.
         max_length (int): Maximum length of the generated sequence.
+        vision_feature_selection (str): Method to select vision features ('cls', 'all', 'mean', 'attention_weighted').
+        vision_freeze_pattern (str): Pattern for selectively freezing vision encoder layers.
+        vision_unfreeze_layers (List[int]): Specific vision encoder layers to unfreeze.
+        output_attentions (bool): Whether to output attention weights.
+        output_hidden_states (bool): Whether to output hidden states from all layers.
     """
-    def __init__(self, encoder_type='resnet', encoder_model='resnet50',
-                 mapper_type='transformer', mapper_hidden_dim=768, mapper_num_layers=2,
-                 mapper_num_heads=8, mapper_seq_len=16, mapper_dropout=0.1,
-                 decoder_type='gpt2', decoder_model='gpt2', freeze_encoder=True,
-                 freeze_decoder=True, pretrained_encoder=True, pretrained_decoder=True,
-                 tokenizer_name='gpt2', max_length=512):
+    def __init__(
+        self, 
+        vision_model_name: str = 'google/vit-base-patch16-224',
+        gpt2_model_name: str = 'gpt2', 
+        freeze_vision: bool = True,
+        freeze_decoder: bool = True, 
+        pretrained_vision: bool = True, 
+        pretrained_decoder: bool = True,
+        decoder_hidden_dim: int = 768,
+        tokenizer_name: str = 'gpt2', 
+        max_length: int = 512,
+        vision_feature_selection: str = 'all',
+        vision_freeze_pattern: str = 'none',
+        vision_unfreeze_layers: Optional[List[int]] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
         super().__init__()
         
         # Save parameters
-        self.encoder_type = encoder_type
-        self.encoder_model = encoder_model
-        self.mapper_type = mapper_type
-        self.decoder_type = decoder_type
-        self.decoder_model = decoder_model
+        self.vision_model_name = vision_model_name
+        self.gpt2_model_name = gpt2_model_name
         self.max_length = max_length
+        self.decoder_hidden_dim = decoder_hidden_dim
+        self.vision_feature_selection = vision_feature_selection
         
         # Save freeze parameters
-        self.freeze_encoder = freeze_encoder
+        self.freeze_vision = freeze_vision
         self.freeze_decoder = freeze_decoder
         
         # Init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, padding_side='left')
         
-        # Configure tokenizer properly for GPT2 and other models
+        # Configure tokenizer properly for GPT2
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             # Update the tokenizer's vocabulary with the pad token
@@ -60,70 +69,137 @@ class RadiologyReportGenerator(nn.Module):
         # Set padding side to left for autoregressive models like GPT2
         self.tokenizer.padding_side = 'left'
         
-        # Define encoder
+        # Define enhanced vision encoder with the selected feature extraction method
         self.vision_encoder = get_vision_encoder(
-            encoder_type,
-            encoder_model,
-            pretrained=pretrained_encoder,
-            freeze=freeze_encoder
+            model_name=vision_model_name,
+            pretrained=pretrained_vision,
+            freeze_base=freeze_vision,
+            freeze_pattern=vision_freeze_pattern,
+            unfreeze_layers=vision_unfreeze_layers,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            feature_selection=vision_feature_selection,
+            use_cls_token=True
         )
         
-        # Define encoder output dimension
-        if encoder_type == 'resnet':
-            if encoder_model == 'resnet18' or encoder_model == 'resnet34':
-                encoder_dim = 512
-            else:  # resnet50, resnet101, resnet152
-                encoder_dim = 2048
-        else:  # ViT
-            encoder_dim = 768  # For base ViT models
+        # Get the output dimension from the vision encoder
+        encoder_dim = self.vision_encoder.output_dim
         
-        # Define mapping network
-        self.mapping_network = get_mapping_network(
-            mapper_type,
-            input_dim=encoder_dim,
-            hidden_dim=mapper_hidden_dim,
-            output_dim=mapper_hidden_dim,
-            num_layers=mapper_num_layers,
-            num_heads=mapper_num_heads,
-            seq_len=mapper_seq_len,
-            dropout=mapper_dropout
-        )
+        # --- Define projection layer ---
+        # This projection setup depends on the feature_selection method
+        if vision_feature_selection in ['cls', 'mean']:
+            # For CLS token or mean pooling, we get a single vector per image
+            # We need to project and expand to create a sequence
+            self.use_single_vector = True
+            self.vision_projection = nn.Linear(encoder_dim, self.decoder_hidden_dim)
+            # Generate a sequence of tokens from the single vector
+            self.seq_len = 16  # Number of tokens to generate
+            self.create_sequence = True
+            
+            # Positional embeddings for expanding to a sequence
+            self.position_embeddings = nn.Parameter(
+                torch.zeros(1, self.seq_len, self.decoder_hidden_dim)
+            )
+        else:
+            # For 'all' or 'attention_weighted', we already have a sequence
+            self.use_single_vector = False
+            self.vision_projection = nn.Linear(encoder_dim, self.decoder_hidden_dim)
+            self.create_sequence = False
+        # --- End projection layer ---
         
-        # Define embedding adapter
-        if mapper_type == 'transformer':
-            # For transformer mapper, adapt the flattened output to decoder embedding dim
-            mapper_output_dim = mapper_hidden_dim * mapper_seq_len
-            self.embedding_adapter = nn.Linear(mapper_output_dim, mapper_hidden_dim)
-        
-        # Define language decoder
+        # Define GPT-2 language decoder with cross-attention
         self.language_decoder = get_language_decoder(
-            decoder_type,
-            decoder_model,
+            model_name=gpt2_model_name,
             pretrained=pretrained_decoder,
             freeze=freeze_decoder
         )
         
+        # Ensure the decoder's underlying model config uses the correct pad token ID
+        self.language_decoder.model.config.pad_token_id = self.tokenizer.pad_token_id
+        
+        # Check if decoder's hidden size matches the projection target
+        decoder_hidden_size = getattr(self.language_decoder.model.config, 'hidden_size', 
+                                     getattr(self.language_decoder.model.config, 'n_embd', None))
+        
+        if decoder_hidden_size and decoder_hidden_size != self.decoder_hidden_dim:
+             print(f"Warning: Decoder hidden size ({decoder_hidden_size}) "
+                   f"differs from target projection dimension ({self.decoder_hidden_dim}). "
+                   f"Ensure `decoder_hidden_dim` matches the decoder's requirements.")
+        
         # Initialize weights
         self._init_weights()
+        
+        # --- Start: Training configuration reminders ---
+        if freeze_decoder:
+             print("Warning: freeze_decoder is set to True. The language decoder weights will not be trained. "
+                   "This should typically be False during active training stages.")
+        # --- End: Training configuration reminders ---
     
     def _init_weights(self):
         """
         Initialize weights for the model.
         """
-        # Initialize weights for mapping network
-        if hasattr(self.mapping_network, 'apply'):
-            def init_weights(m):
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+        # Initialize weights for the projection layer
+        nn.init.xavier_uniform_(self.vision_projection.weight)
+        if self.vision_projection.bias is not None:
+            nn.init.zeros_(self.vision_projection.bias)
             
-            self.mapping_network.apply(init_weights)
+        # Initialize position embeddings if used
+        if hasattr(self, 'position_embeddings'):
+            nn.init.normal_(self.position_embeddings, mean=0.0, std=0.02)
+    
+    def _process_vision_features(self, features):
+        """
+        Process vision features based on the selected feature extraction method.
         
-        # Initialize weights for embedding adapter if exists
-        if hasattr(self, 'embedding_adapter'):
-            nn.init.xavier_uniform_(self.embedding_adapter.weight)
-            nn.init.zeros_(self.embedding_adapter.bias)
+        Args:
+            features: Output from the vision encoder, could be tensor or dict
+            
+        Returns:
+            projected_features: Features projected to decoder's dimension
+            encoder_attention_mask: Attention mask for the encoder features
+        """
+        # Handle both tensor and dictionary outputs from the enhanced encoder
+        if isinstance(features, dict):
+            image_features = features["features"]
+        else:
+            image_features = features
+            
+        batch_size = image_features.size(0)
+        
+        # Handle features based on their dimensionality
+        if self.use_single_vector:
+            # Case: Single vector per image (cls token or mean pooling)
+            if len(image_features.shape) == 2:  # [B, D]
+                # Project to decoder dimension
+                projected_vector = self.vision_projection(image_features)
+                
+                if self.create_sequence:
+                    # Expand to sequence and add positional embeddings
+                    projected_features = projected_vector.unsqueeze(1).expand(-1, self.seq_len, -1)
+                    projected_features = projected_features + self.position_embeddings
+                    # Create attention mask (all ones)
+                    encoder_attention_mask = torch.ones(batch_size, self.seq_len, 
+                                                      device=projected_features.device, dtype=torch.long)
+                else:
+                    # Keep as a single token
+                    projected_features = projected_vector.unsqueeze(1)  # [B, 1, D]
+                    encoder_attention_mask = torch.ones(batch_size, 1, 
+                                                      device=projected_features.device, dtype=torch.long)
+            else:
+                raise ValueError(f"Expected 2D tensor for 'cls' or 'mean' feature selection, got shape {image_features.shape}")
+        else:
+            # Case: Sequence of vectors (all tokens or attention weighted)
+            if len(image_features.shape) == 3:  # [B, S, D]
+                # Project each token to decoder dimension
+                projected_features = self.vision_projection(image_features)
+                # Create attention mask (all ones)
+                encoder_attention_mask = torch.ones(batch_size, projected_features.size(1), 
+                                                   device=projected_features.device, dtype=torch.long)
+            else:
+                raise ValueError(f"Expected 3D tensor for 'all' or 'attention_weighted' feature selection, got shape {image_features.shape}")
+                
+        return projected_features, encoder_attention_mask
     
     def forward(self, images, input_ids=None, attention_mask=None, labels=None):
         """
@@ -138,121 +214,75 @@ class RadiologyReportGenerator(nn.Module):
         Returns:
             dict: Model outputs.
         """
-        # Make sure the model is in train mode for the active parts
-        if not self.freeze_encoder:
+        # Set appropriate train/eval mode
+        if not self.freeze_vision:
             self.vision_encoder.train()
         else:
             self.vision_encoder.eval()
         
         # Extract image features using the vision encoder
-        with torch.set_grad_enabled(not self.freeze_encoder):
-            image_features = self.vision_encoder(images)
+        with torch.set_grad_enabled(not self.freeze_vision):
+            vision_outputs = self.vision_encoder(images)
         
-        # If image features don't require grad but should, enable it
-        if not self.freeze_encoder and not image_features.requires_grad:
-            image_features.requires_grad_(True)
+        # Process and project vision features
+        encoder_hidden_states, encoder_attention_mask = self._process_vision_features(vision_outputs)
         
-        # Map image features to decoder-compatible embeddings
-        if self.mapper_type == 'mlp':
-            # MLP mapper outputs a single embedding
-            mapped_features = self.mapping_network(image_features)
+        # Pass additional vision outputs if available
+        additional_encoder_outputs = {}
+        if isinstance(vision_outputs, dict):
+            if 'attentions' in vision_outputs:
+                additional_encoder_outputs['encoder_attentions'] = vision_outputs['attentions']
+            if 'hidden_states' in vision_outputs:
+                additional_encoder_outputs['encoder_hidden_states'] = vision_outputs['hidden_states']
+        
+        # Prepare inputs for the decoder
+        if input_ids is not None and labels is not None:
+            # Training/Validation with Labels: Use provided input_ids and cross-attention
+            outputs = self.language_decoder(
+                inputs=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                return_dict=True,
+                **additional_encoder_outputs
+            )
             
-            # Add batch dimension if needed
-            if len(mapped_features.shape) == 1:
-                mapped_features = mapped_features.unsqueeze(0)
-                
-            # Prepare inputs for the decoder
-            if input_ids is not None:
-                # Training mode: Use provided input_ids
-                outputs = self.language_decoder(
-                    inputs=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-                # Ensure loss has gradients
-                if not outputs.loss.requires_grad:
-                    # This shouldn't normally happen, but let's handle it just in case
-                    print("Warning: Loss doesn't require gradients. This may cause backpropagation issues.")
-                
-                return {
-                    "loss": outputs.loss,
-                    "logits": outputs.logits
-                }
-            else:
-                # Inference mode: Generate from the model
-                # Create a prompt with BOS token
-                prompt_ids = torch.full(
-                    (image_features.size(0), 1),
-                    self.tokenizer.bos_token_id,
-                    dtype=torch.long,
-                    device=image_features.device
-                )
-                
-                outputs = self.language_decoder.generate(
-                    input_ids=prompt_ids,
-                    max_length=self.max_length,
-                    num_beams=4,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,
-                    min_length=10
-                )
-                
-                return {"generated_ids": outputs}
-                
-        else:  # transformer mapper
-            # Transformer mapper outputs a sequence of embeddings
-            mapped_features = self.mapping_network(image_features)
-            
-            # Flatten the sequence for the embedding adapter
-            batch_size = mapped_features.size(0)
-            flat_features = mapped_features.view(batch_size, -1)
-            
-            # Adapt to decoder embeddings
-            adapted_features = self.embedding_adapter(flat_features)
-            
-            # Prepare inputs for the decoder
-            if input_ids is not None:
-                # Training mode: Use provided input_ids
-                outputs = self.language_decoder(
-                    inputs=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-                # Ensure loss has gradients
-                if not outputs.loss.requires_grad:
-                    # This shouldn't normally happen, but let's handle it just in case
-                    print("Warning: Loss doesn't require gradients. This may cause backpropagation issues.")
-                
-                return {
-                    "loss": outputs.loss,
-                    "logits": outputs.logits
-                }
-            else:
-                # Inference mode: Generate from the model
-                # Create a prompt with BOS token
-                prompt_ids = torch.full(
-                    (image_features.size(0), 1),
-                    self.tokenizer.bos_token_id,
-                    dtype=torch.long,
-                    device=image_features.device
-                )
-                
-                outputs = self.language_decoder.generate(
-                    input_ids=prompt_ids,
-                    max_length=self.max_length,
-                    num_beams=4,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,
-                    min_length=10
-                )
-                
-                return {"generated_ids": outputs}
+            return {
+                "loss": outputs.loss,
+                "logits": outputs.logits
+            }
+        else:
+            # Inference Mode: Generate text using encoder_hidden_states
+            # Use a structured textual prefix for generation
+            prefix_text = "FINAL REPORT  "
+            # Tokenize the prefix and move to the same device
+            prefix_ids = self.tokenizer(prefix_text, return_tensors="pt").input_ids.to(encoder_hidden_states.device)
+            # Expand the prefix tokens to match the batch size
+            batch_size = images.size(0)
+            prompt_ids = prefix_ids.expand(batch_size, -1)
+            prompt_attention_mask = torch.ones_like(prompt_ids)
+
+            # Generate using the decoder's generate method with cross-attention
+            outputs = self.language_decoder.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                max_length=self.max_length,
+                min_length=10,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=3,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+
+            return {"generated_ids": outputs}
     
     def generate(self, images):
         """
-        Generate reports from images.
+        Generate reports from images using the forward pass in inference mode.
         
         Args:
             images (torch.Tensor): Input images of shape (batch_size, channels, height, width).
@@ -263,81 +293,15 @@ class RadiologyReportGenerator(nn.Module):
         # Set model to evaluation mode
         self.eval()
         
-        # Extract image features
+        # Perform inference using the forward pass
         with torch.no_grad():
-            image_features = self.vision_encoder(images)
+            outputs = self.forward(images=images)
         
-        # Map image features to decoder-compatible embeddings
-        if self.mapper_type == 'mlp':
-            mapped_features = self.mapping_network(image_features)
-            
-            # Add batch dimension if needed
-            if len(mapped_features.shape) == 1:
-                mapped_features = mapped_features.unsqueeze(0)
-                
-            # Create a prompt with BOS token
-            prompt_ids = torch.full(
-                (image_features.size(0), 1),
-                self.tokenizer.bos_token_id,
-                dtype=torch.long,
-                device=image_features.device
-            )
-            
-            # Create attention mask - all 1s for the prompt
-            attention_mask = torch.ones_like(prompt_ids)
-            
-            # Generate text
-            with torch.no_grad():
-                outputs = self.language_decoder.generate(
-                    input_ids=prompt_ids,
-                    attention_mask=attention_mask,
-                    max_length=self.max_length,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    num_beams=4,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,
-                    min_length=10
-                )
-        else:  # transformer mapper
-            # Transformer mapper outputs a sequence of embeddings
-            mapped_features = self.mapping_network(image_features)
-            
-            # Flatten the sequence for the embedding adapter
-            batch_size = mapped_features.size(0)
-            flat_features = mapped_features.view(batch_size, -1)
-            
-            # Adapt to decoder embeddings
-            adapted_features = self.embedding_adapter(flat_features)
-            
-            # Create a prompt with BOS token
-            prompt_ids = torch.full(
-                (image_features.size(0), 1),
-                self.tokenizer.bos_token_id,
-                dtype=torch.long,
-                device=image_features.device
-            )
-            
-            # Create attention mask - all 1s for the prompt
-            attention_mask = torch.ones_like(prompt_ids)
-            
-            # Generate text
-            with torch.no_grad():
-                outputs = self.language_decoder.generate(
-                    input_ids=prompt_ids,
-                    attention_mask=attention_mask,
-                    max_length=self.max_length,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    num_beams=4,
-                    early_stopping=True,
-                    no_repeat_ngram_size=3,
-                    min_length=10
-                )
+        generated_ids = outputs["generated_ids"]
         
         # Decode generated tokens to text
         generated_texts = []
-        for ids in outputs:
+        for ids in generated_ids:
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
             generated_texts.append(text.strip())
         
@@ -355,20 +319,18 @@ def get_report_generator(config):
         RadiologyReportGenerator: Complete model.
     """
     return RadiologyReportGenerator(
-        encoder_type=config.get('encoder_type', 'resnet'),
-        encoder_model=config.get('encoder_model', 'resnet50'),
-        mapper_type=config.get('mapper_type', 'transformer'),
-        mapper_hidden_dim=config.get('mapper_hidden_dim', 768),
-        mapper_num_layers=config.get('mapper_num_layers', 2),
-        mapper_num_heads=config.get('mapper_num_heads', 8),
-        mapper_seq_len=config.get('mapper_seq_len', 16),
-        mapper_dropout=config.get('mapper_dropout', 0.1),
-        decoder_type=config.get('decoder_type', 'gpt2'),
-        decoder_model=config.get('decoder_model', 'gpt2'),
-        freeze_encoder=config.get('freeze_encoder', True),
+        vision_model_name=config.get('vision_model_name', 'google/vit-base-patch16-224'),
+        gpt2_model_name=config.get('gpt2_model_name', 'gpt2'),
+        freeze_vision=config.get('freeze_vision', True),
         freeze_decoder=config.get('freeze_decoder', True),
-        pretrained_encoder=config.get('pretrained_encoder', True),
+        pretrained_vision=config.get('pretrained_vision', True),
         pretrained_decoder=config.get('pretrained_decoder', True),
+        decoder_hidden_dim=config.get('decoder_hidden_dim', 768),
         tokenizer_name=config.get('tokenizer_name', 'gpt2'),
-        max_length=config.get('max_length', 512)
+        max_length=config.get('max_length', 512),
+        vision_feature_selection=config.get('vision_feature_selection', 'all'),
+        vision_freeze_pattern=config.get('vision_freeze_pattern', 'none'),
+        vision_unfreeze_layers=config.get('vision_unfreeze_layers', None),
+        output_attentions=config.get('output_attentions', False),
+        output_hidden_states=config.get('output_hidden_states', False)
     ) 

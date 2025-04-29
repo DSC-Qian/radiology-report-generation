@@ -74,7 +74,7 @@ class Trainer:
             test_size=self.config.train_config['test_size'],
             val_size=self.config.train_config['val_size'],
             seed=self.config.train_config['seed'],
-            max_samples=self.config.train_config['max_samples']
+            max_samples=1000
         )
         
         # Setup tensorboard
@@ -129,12 +129,96 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_combined_score = -float('inf')  # For combined metrics (higher is better)
         self.best_val_metrics = None
         self.patience_counter = 0
         
         # Load checkpoint if provided
         if resume_from is not None:
             self.load_checkpoint(resume_from)
+    
+    def calculate_combined_score(self, metrics, val_loss):
+        """
+        Calculate a combined score based on multiple metrics for early stopping.
+        
+        Args:
+            metrics (dict): Dictionary of evaluation metrics.
+            val_loss (float): Validation loss.
+            
+        Returns:
+            float: Combined score (higher is better).
+        """
+        # Define weights for different metric categories
+        clinical_weight = 0.6  # Higher weight for clinical accuracy
+        nlp_weight = 0.3       # Weight for NLP metrics
+        loss_weight = 0.1      # Small weight for validation loss
+        
+        # Initialize scores
+        clinical_score = 0.0
+        nlp_score = 0.0
+        
+        # Calculate clinical metrics score (if available)
+        clinical_metrics = []
+        if 'chexbert' in metrics:
+            # If CheXbert results are available
+            if isinstance(metrics['chexbert'], dict):
+                # Average F1 scores across all conditions
+                f1_scores = [v.get('f1', 0.0) for k, v in metrics['chexbert'].items() 
+                            if isinstance(v, dict) and 'f1' in v]
+                if f1_scores:
+                    clinical_metrics.append(np.mean(f1_scores))
+        
+        # Add RadGraph scores if available
+        if 'radgraph' in metrics and isinstance(metrics['radgraph'], dict):
+            if 'f1' in metrics['radgraph']:
+                clinical_metrics.append(metrics['radgraph']['f1'])
+        
+        # Add entity recognition scores if available
+        if 'entity_f1' in metrics:
+            clinical_metrics.append(metrics['entity_f1'])
+        
+        # Calculate clinical score
+        if clinical_metrics:
+            clinical_score = np.mean(clinical_metrics)
+        
+        # Calculate NLP metrics score
+        nlp_metrics = []
+        
+        # ROUGE-L (typically under 'rouge' key with 'l' subkey)
+        if 'rouge' in metrics and isinstance(metrics['rouge'], dict) and 'l' in metrics['rouge']:
+            if isinstance(metrics['rouge']['l'], dict) and 'f' in metrics['rouge']['l']:
+                nlp_metrics.append(metrics['rouge']['l']['f'])
+            elif isinstance(metrics['rouge']['l'], (int, float)):
+                nlp_metrics.append(metrics['rouge']['l'])
+        
+        # BLEU score
+        if 'bleu' in metrics:
+            nlp_metrics.append(metrics['bleu'])
+        
+        # BERTScore
+        if 'bertscore' in metrics and isinstance(metrics['bertscore'], dict) and 'f1' in metrics['bertscore']:
+            nlp_metrics.append(metrics['bertscore']['f1'])
+        
+        # Calculate NLP score
+        if nlp_metrics:
+            nlp_score = np.mean(nlp_metrics)
+        
+        # Normalize validation loss to a 0-1 scale where higher is better
+        # Assuming validation loss is typically in range 0-10
+        loss_score = max(0, 1 - (val_loss / 10.0))
+        
+        # Calculate combined score
+        combined_score = (
+            clinical_weight * clinical_score + 
+            nlp_weight * nlp_score + 
+            loss_weight * loss_score
+        )
+        
+        # Log the component scores
+        print(f"Combined Score Components - Clinical: {clinical_score:.4f}, NLP: {nlp_score:.4f}, Loss: {loss_score:.4f}")
+        print(f"Combined Score: {combined_score:.4f}")
+        
+        return combined_score
     
     def train(self):
         """
@@ -159,13 +243,27 @@ class Trainer:
             if (epoch + 1) % self.config.train_config['eval_interval'] == 0:
                 val_loss, val_metrics = self.evaluate()
                 
+                # Calculate combined score for early stopping
+                combined_score = self.calculate_combined_score(val_metrics, val_loss)
+                
                 # Update scheduler if using reduce_on_plateau
                 if self.config.train_config['scheduler'] == 'reduce_on_plateau':
                     self.scheduler.step(val_loss)
                 
-                # Save checkpoint if improved
+                # Check if model improved based on combined score
+                improved = False
+                if combined_score > self.best_combined_score:
+                    print(f"Combined score improved from {self.best_combined_score:.4f} to {combined_score:.4f}")
+                    self.best_combined_score = combined_score
+                    improved = True
+                    
+                # Also track validation loss improvement for compatibility
                 if val_loss < self.best_val_loss:
+                    print(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}")
                     self.best_val_loss = val_loss
+                    
+                # Save checkpoint if improved on combined score
+                if improved:
                     self.best_val_metrics = val_metrics
                     self.patience_counter = 0
                     
@@ -176,15 +274,28 @@ class Trainer:
                     )
                 else:
                     self.patience_counter += 1
+                    print(f"No improvement in combined score. Patience counter: {self.patience_counter}/{self.config.train_config['early_stopping_patience']}")
                 
                 # Log metrics
                 self.writer.add_scalar('Loss/validation', val_loss, epoch)
-                for metric_name, metric_value in val_metrics.items():
-                    self.writer.add_scalar(f'Metrics/{metric_name}', metric_value, epoch)
+                self.writer.add_scalar('Metrics/combined_score', combined_score, epoch)
                 
-                # Early stopping
+                for metric_name, metric_value in val_metrics.items():
+                    # Handle different metric types for TensorBoard logging
+                    if isinstance(metric_value, dict):
+                        # For dictionary metrics, log each key-value pair separately
+                        for k, v in metric_value.items():
+                            if isinstance(v, (int, float)):
+                                self.writer.add_scalar(f'Metrics/{metric_name}/{k}', v, epoch)
+                            # Skip string values for TensorBoard (it only accepts numeric values)
+                    elif isinstance(metric_value, (int, float)):
+                        # For scalar metrics, log directly
+                        self.writer.add_scalar(f'Metrics/{metric_name}', metric_value, epoch)
+                    # Skip string values for TensorBoard (it only accepts numeric values)
+                
+                # Early stopping based on patience
                 if self.patience_counter >= self.config.train_config['early_stopping_patience']:
-                    print(f"Early stopping at epoch {epoch+1}")
+                    print(f"Early stopping at epoch {epoch+1}. No improvement in combined score for {self.patience_counter} evaluations.")
                     break
             
             # Save checkpoint periodically
@@ -334,6 +445,7 @@ class Trainer:
                 
                 loss = outputs['loss']
                 val_loss += loss.item()
+                del outputs, loss
                 
                 # Generate text for metrics
                 generated_texts = self.model.generate(images)
@@ -347,6 +459,8 @@ class Trainer:
                     # Generated text (already decoded in model.generate)
                     hypothesis = generated_texts[i]
                     hypotheses.append(hypothesis)
+
+        torch.cuda.empty_cache()
         
         # Calculate average loss
         val_loss /= len(self.val_loader)
@@ -357,7 +471,18 @@ class Trainer:
         # Log metrics
         print(f"Validation loss: {val_loss:.4f}")
         for metric_name, metric_value in metrics.items():
-            print(f"{metric_name}: {metric_value:.4f}")
+            # Print out metrics, handling different value types
+            if isinstance(metric_value, dict):
+                print(f"{metric_name}:")
+                for k, v in metric_value.items():
+                    if isinstance(v, (int, float)):
+                        print(f"  {k}: {v:.4f}")
+                    else:
+                        print(f"  {k}: {v}")
+            elif isinstance(metric_value, (int, float)):
+                print(f"{metric_name}: {metric_value:.4f}")
+            else:
+                print(f"{metric_name}: {metric_value}")
         
         return val_loss, metrics
     
@@ -374,6 +499,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
+            'best_combined_score': self.best_combined_score,
             'best_val_metrics': self.best_val_metrics,
             'epoch': self.start_epoch,
             'global_step': self.global_step,
@@ -389,7 +515,7 @@ class Trainer:
         torch.save(checkpoint, filepath)
         
         if is_best:
-            print(f"Saving best model with validation loss: {self.best_val_loss:.4f}")
+            print(f"Saving best model with combined score: {self.best_combined_score:.4f}, validation loss: {self.best_val_loss:.4f}")
     
     def load_checkpoint(self, filepath):
         """
@@ -402,7 +528,7 @@ class Trainer:
             print(f"Checkpoint not found: {filepath}")
             return
         
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         # Load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -428,18 +554,21 @@ class Trainer:
                 self.start_epoch = checkpoint['epoch'] + 1
                 self.global_step = checkpoint['global_step']
                 self.best_val_loss = checkpoint['best_val_loss']
+                self.best_combined_score = checkpoint.get('best_combined_score', -float('inf'))  # Default if not present
                 self.best_val_metrics = checkpoint['best_val_metrics']
                 self.patience_counter = checkpoint['patience_counter']
                 
                 print(f"Resumed from checkpoint: {filepath}")
                 print(f"Starting from epoch: {self.start_epoch}")
                 print(f"Best validation loss: {self.best_val_loss:.4f}")
+                print(f"Best combined score: {self.best_combined_score:.4f}")
             except (ValueError, KeyError) as e:
                 print(f"Warning: Could not load optimizer/scheduler states: {e}")
                 print("Initializing new optimizer and scheduler while keeping model weights.")
                 self.start_epoch = 0
                 self.global_step = 0
                 self.best_val_loss = float('inf')
+                self.best_combined_score = -float('inf')
                 self.best_val_metrics = None
                 self.patience_counter = 0
         else:
@@ -449,6 +578,7 @@ class Trainer:
             self.start_epoch = 0
             self.global_step = 0
             self.best_val_loss = float('inf')
+            self.best_combined_score = -float('inf')
             self.best_val_metrics = None
             self.patience_counter = 0
 
