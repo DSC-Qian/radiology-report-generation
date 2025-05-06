@@ -93,7 +93,7 @@ gcloud storage --billing-project project_name cp -r given_url .
 Both MIMIC-CXR and MIMIC-CXR-JPG have copies saved on Google Cloud Platform. You need to first create a project and link to the dataset, then you can download with the code above by replacing ```project_name``` and ```given_url```. Note that this method is super fast comparing to Method 1, but it is not free. It will cost around $57 credits to download the images.
 
 ### Data Preprocessing
-You need to run ```python preprocessing.py``` to do the data preprocessing. It will create a CSV file that contains the image and report pairs.
+You need to run ```python preprocessing.py``` to do the data preprocessing. It will create ```mimic-cxr-list-filtered.csv``` that contains the image and report pairs.
 
 ## Model Architecture
 
