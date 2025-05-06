@@ -31,7 +31,8 @@ This project implements an end-to-end deep learning system that generates radiol
 ├── inference.py               # Script for generating reports from new images
 ├── main.py                    # Main script to run training and evaluation
 ├── requirements.txt           # Project dependencies
-└── README.md                  # Project documentation
+├── README.md                  # Project documentation
+└── preprocessing.py           # Script to preprocess the dataset
 ```
 
 ## Setup
@@ -43,6 +44,67 @@ This project implements an end-to-end deep learning system that generates radiol
    ```
 3. Download the MIMIC-CXR dataset (or use the provided subset)
 4. Organize the data following the MIMIC-CXR structure
+
+## Dataset Information
+
+The MIMIC-CXR dataset contains chest X-ray images and associated reports from the Beth Israel Deaconess Medical Center between 2011-2016. It includes:
+
+- 377,110 images corresponding to 227,835 radiographic studies.
+- Each study includes one or more images and a free-text radiology report with findings, impressions, and recommendations.
+
+## Dataset Download
+
+MIMIC-CXR is a restricted-access dataset that requires users to request access. Therefore, we cannot provide a direct download script or similar utility. In the following section, we briefly outline the steps for obtaining access to the dataset and provide guidance on what and how to download once access has been granted.
+
+### Request access
+1. Become a credentialed user of [PhysioNet](https://physionet.org/)
+2. Complete the required training: CITI Data or Specimens Only Research
+3. Sign the data use agreement for [MIMIC-CXR](https://physionet.org/content/mimic-cxr/2.1.0/) and [MIMIC-CXR-JPG](https://physionet.org/content/mimic-cxr-jpg/2.1.0/)
+
+### What to download
+#### MIMIC-CXR
+```
+.
+├── cxr-record-list.csv.gz     # Image information
+├── cxr-study-list.csv.gz      # Report information
+└── mimic-cxr-reports.zip      # Radiology reports
+```
+
+#### MIMIC-CXR-JPG
+```
+.
+├── files/                               # X-ray images
+└── mimic-cxr-2.0.0-metadata.csv.gz      # Image metadata
+```
+
+You need to unzip all zip files and rename the image and report folder from "files" to "images" and "reports".
+
+### How to download
+#### Method 1
+``` 
+wget -r -N -c -np --user physionet_username --ask-password given_url 
+```
+PhysioNet allows users to directly download the dataset from their website. You need to replace ```physionet_username``` and ```given_url``` above to download it. Note that this method can be very slow.
+
+#### Method 2
+```
+gcloud storage --billing-project project_name cp -r given_url .
+```
+Both MIMIC-CXR and MIMIC-CXR-JPG have copies saved on Google Cloud Platform. You need to first create a project and link to the dataset, then you can download with the code above by replacing ```project_name``` and ```given_url```. Note that this method is super fast comparing to Method 1, but it is not free. It will cost around $57 credits to download the images.
+
+### Data Preprocessing
+You need to run ```python preprocessing.py``` to do the data preprocessing. It will create a CSV file that contains the image and report pairs.
+
+## Model Architecture
+
+- **Vision Encoder**: Pre-trained Vision Transformer (ViT) to extract spatial image features
+- **Projection Layer**: A linear layer that maps the output of vision encoder to the input of language decoder
+- **Language Decoder**: GPT-2 for report generation
+
+## Evaluation Metrics
+
+- **Text Overlap**: BLEU, ROUGE-L
+- **Clinical Correctness**: BERTScore F1, Clinical Terms F1, CheXpert label accuracy
 
 ## Usage
 
@@ -73,88 +135,3 @@ python inference.py single --image path/to/image.jpg --checkpoint path/to/checkp
 # Batch inference
 python inference.py batch --image_dir path/to/images/ --output_dir path/to/output/ --checkpoint path/to/checkpoint
 ```
-
-## Model Architecture
-
-- **Vision Encoder**: Pre-trained ResNet-121 (CheXNet) or Vision Transformer (ViT) to extract spatial image features
-- **Mapping Network**: Transformer or MLP to project image features into sequence embeddings
-- **Language Decoder**: GPT-2 or BioGPT for report generation
-
-## Evaluation Metrics
-
-- **Text Overlap**: BLEU, ROUGE-L, METEOR
-- **Clinical Correctness**: CheXpert label F1 or BERTScore
-
-## Dataset Information
-
-The MIMIC-CXR-JPG dataset contains chest X-ray images and associated reports from the Beth Israel Deaconess Medical Center. It includes:
-
-- Over 377,000 images corresponding to 227,835 radiographic studies
-- Imaging studies performed at Beth Israel Deaconess Medical Center between 2011-2016
-- Free-text radiology reports with findings, impressions, and recommendations
-
-# MIMIC-CXR-JPG Dataset Downloader
-
-This script provides utilities for downloading the MIMIC-CXR-JPG dataset to a Modal volume for use in radiology report generation.
-
-## Prerequisites
-
-1. PhysioNet credentials with access to the MIMIC-CXR-JPG dataset
-   - You'll need to complete the required training and get approved for access on the [PhysioNet website](https://physionet.org/content/mimic-cxr-jpg/2.0.0/)
-
-2. Modal setup
-   - Install Modal: `pip install -r download_requirements.txt`
-   - Authenticate with Modal: `modal token new`
-
-## Usage
-
-### Setting up credentials
-
-Set your PhysioNet credentials as environment variables:
-
-```bash
-# On Windows
-set PHYSIONET_USER=your_username
-set PHYSIONET_PASSWORD=your_password
-
-# On Linux/Mac
-export PHYSIONET_USER=your_username
-export PHYSIONET_PASSWORD=your_password
-```
-
-### Running the download
-
-```bash
-python download_mimic_cxr.py
-```
-
-This will:
-1. Create a Modal volume named "mimic-cxr-jpg-volume" if it doesn't exist
-2. Download the MIMIC-CXR-JPG dataset to this volume using wget
-3. The download is performed on Modal's infrastructure, not your local machine
-4. The data will be persisted in the Modal volume for future use
-5. Your PhysioNet credentials are automatically passed from your local environment to Modal
-
-### Alternative Download Method
-
-If you have SSH access to PhysioNet, you can modify the main function in the script to use rsync instead:
-
-```python
-@app.local_entrypoint()
-def main():
-    download_mimic_cxr_rsync.remote(
-        _env={"PHYSIONET_USER": os.environ.get("PHYSIONET_USER", "")}
-    )
-```
-
-## Notes
-
-- The dataset is large (several hundred GB), so the download may take considerable time
-- The Modal function has a 24-hour timeout, which should be sufficient for most internet connections
-- You can resume interrupted downloads thanks to the `-c` (continue) flag used with wget
-- The download uses Modal's infrastructure, so you can close your laptop and the download will continue on Modal's servers
-
-## Troubleshooting
-
-- If you encounter authentication issues, verify your PhysioNet credentials are correct and that you have access to the MIMIC-CXR-JPG dataset
-- For Modal-related issues, check the Modal documentation at [https://modal.com/docs](https://modal.com/docs)
